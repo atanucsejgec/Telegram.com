@@ -8,9 +8,13 @@
     <meta name="description"
         content="Telegram Drive: Unlimited cloud storage powered by Telegram. Upload, organize, and preview your files securely.">
     <link rel="stylesheet" href="css/style.css">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600;12..96,700;12..96,800&family=Instrument+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500;600&display=swap"
         rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+    <meta name="theme-color" content="#07090f">
 </head>
 
 <body>
@@ -242,14 +246,11 @@
                 <h1>Telegram Drive</h1>
                 <p>Unlimited cloud storage, powered by Telegram</p>
             </div>
-            <div class="login-tabs"
-                style="display: flex; gap: 4px; margin-bottom: 20px; background: rgba(255,255,255,0.05); padding: 4px; border-radius: 8px;">
-                <button class="tab-btn active" id="tab-user" onclick="window.setLoginMethod('user')"
-                    style="flex: 1; padding: 8px; border: none; background: transparent; color: var(--text-2); cursor: pointer; border-radius: 6px; font-weight: 600; font-size: 13px; transition: all 0.2s;">User
-                    Phone</button>
-                <button class="tab-btn" id="tab-bot" onclick="window.setLoginMethod('bot')"
-                    style="flex: 1; padding: 8px; border: none; background: transparent; color: var(--text-2); cursor: pointer; border-radius: 6px; font-weight: 600; font-size: 13px; transition: all 0.2s;">Bot
-                    Token</button>
+            <div class="login-tabs">
+                <button class="tab-btn active" id="tab-user" onclick="window.setLoginMethod('user')">
+                    <i class="fas fa-user"></i> User Phone</button>
+                <button class="tab-btn" id="tab-bot" onclick="window.setLoginMethod('bot')">
+                    <i class="fas fa-robot"></i> Bot Token</button>
             </div>
             <div id="phone-step" class="auth-step">
                 <div id="api-credentials-group">
@@ -267,6 +268,9 @@
                         <div class="phone-input"><span>+</span>
                             <input type="tel" id="phone-input" placeholder="1234567890">
                         </div>
+                    </div>
+                    <div class="input-group" style="margin-top:8px"><label>Channel ID (Optional)</label>
+                        <input type="text" id="user-channel-id-input" placeholder="e.g. -1004409990919 (leave empty for Saved Messages)">
                     </div>
                     <button class="btn btn-primary btn-full" id="send-code-btn" style="margin-top:16px"
                         onclick="window.sendCode()"><i class="fas fa-paper-plane"></i> Send Code</button>
@@ -315,12 +319,17 @@
                     style="width: 100%; padding: 12px; font-size: 13px; justify-content: center; border-radius: var(--r-sm); box-shadow: 0 4px 12px var(--primary-glow);">
                     <i class="fas fa-upload"></i> New Upload
                 </button>
+                <button class="btn btn-outline" onclick="document.getElementById('folder-upload').click()"
+                    style="width: 100%; padding: 11px; font-size: 13px; justify-content: center; border-radius: var(--r-sm);">
+                    <i class="fas fa-folder-tree"></i> Upload Folder
+                </button>
                 <button class="btn btn-outline" onclick="window.showNewFolder()"
                     style="width: 100%; padding: 11px; font-size: 13px; justify-content: center; border-radius: var(--r-sm);">
                     <i class="fas fa-folder-plus"></i> New Folder
                 </button>
             </div>
             <input type="file" id="file-upload" multiple hidden onchange="handleUpload(event)">
+            <input type="file" id="folder-upload" webkitdirectory multiple hidden onchange="handleUpload(event)">
             <nav class="sidebar-nav">
                 <a href="#" class="nav-item active" data-view="files" onclick="switchView('files')"><i
                         class="fas fa-hard-drive"></i><span>My Drive</span></a>
@@ -336,6 +345,8 @@
                         class="fas fa-music"></i><span>Audio</span></a>
                 <a href="#" class="nav-item" data-view="documents" onclick="switchView('documents')"><i
                         class="fas fa-file-alt"></i><span>Documents</span></a>
+                <a href="#" class="nav-item" data-view="telegram" onclick="switchView('telegram')"><i
+                        class="fab fa-telegram"></i><span>Telegram Files</span></a>
                 <a href="#" class="nav-item" data-view="trash" onclick="switchView('trash')"><i
                         class="fas fa-trash"></i><span>Trash</span><span class="badge" id="trash-badge"></span></a>
             </nav>
@@ -397,9 +408,11 @@
             <div class="selection-bar hidden" id="selection-bar">
                 <div class="selection-info"><span id="selection-count">0</span> selected</div>
                 <div class="selection-actions">
-                    <button onclick="bulkAction('move')" title="Move"><i class="fas fa-arrows-alt"></i> Move</button>
-                    <button onclick="bulkAction('star')" title="Star"><i class="fas fa-star"></i> Star</button>
-                    <button onclick="bulkAction('trash')" title="Trash"><i class="fas fa-trash"></i> Trash</button>
+                    <button id="sel-btn-move" onclick="bulkAction('move')" title="Move"><i class="fas fa-arrows-alt"></i> Move</button>
+                    <button id="sel-btn-star" onclick="bulkAction('star')" title="Star"><i class="fas fa-star"></i> Star</button>
+                    <button id="sel-btn-trash" onclick="bulkAction('trash')" title="Trash"><i class="fas fa-trash"></i> Trash</button>
+                    <button id="sel-btn-tg-import" onclick="bulkImportTelegramFiles()" title="Import to My Drive" class="hidden"><i class="fas fa-file-import"></i> Import</button>
+                    <button id="sel-btn-tg-delete" onclick="bulkDeleteTelegramFiles()" title="Delete from Telegram" class="hidden"><i class="fas fa-trash"></i> Delete from Telegram</button>
                     <button onclick="clearSelection()" title="Cancel"><i class="fas fa-times"></i> Cancel</button>
                 </div>
             </div>

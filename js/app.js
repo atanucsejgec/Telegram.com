@@ -80,8 +80,15 @@ function initCredentialsUI() {
   
   const savedBotToken = localStorage.getItem("tgDriveBotToken");
   const savedChannelId = localStorage.getItem("tgDriveChannelId");
+  const sessionType = localStorage.getItem("tgDriveSessionType") || "user";
   if (savedBotToken) el("bot-token-input").value = savedBotToken;
-  if (savedChannelId) el("channel-id-input").value = savedChannelId;
+  if (savedChannelId) {
+    if (sessionType === "user") {
+      el("user-channel-id-input").value = savedChannelId;
+    } else {
+      el("channel-id-input").value = savedChannelId;
+    }
+  }
 }
 
 function setLoginMethod(method) {
@@ -117,19 +124,16 @@ function parseChannelId(id) {
 }
 
 async function resolveTargetPeer() {
-  const sessionType = localStorage.getItem("tgDriveSessionType") || "user";
-  if (sessionType === "bot") {
-    const channelId = localStorage.getItem("tgDriveChannelId");
-    if (channelId) {
-      try {
-        const parsedId = parseChannelId(channelId);
-        targetPeer = await client.getEntity(parsedId);
-        console.log("Resolved target channel peer:", targetPeer);
-        return;
-      } catch (e) {
-        console.error("Could not resolve target channel peer:", e);
-        toast("Could not access storage channel", "error");
-      }
+  const channelId = localStorage.getItem("tgDriveChannelId");
+  if (channelId) {
+    try {
+      const parsedId = parseChannelId(channelId);
+      targetPeer = await client.getEntity(parsedId);
+      console.log("Resolved target channel peer:", targetPeer);
+      return;
+    } catch (e) {
+      console.error("Could not resolve target channel peer:", e);
+      toast("Could not access storage channel", "error");
     }
   }
   targetPeer = "me";
@@ -523,6 +527,7 @@ async function sendCode() {
     window._phoneNumber = phone;
     window._apiId = apiId;
     window._apiHash = apiHash;
+    window._userChannelId = el("user-channel-id-input").value.trim();
     
     hide("phone-step");
     show("code-step");
@@ -577,11 +582,26 @@ async function verifyCode() {
     }
     
     const me = await client.getMe();
+    
+    if (window._userChannelId) {
+      try {
+        const parsedId = parseChannelId(window._userChannelId);
+        await client.getEntity(parsedId);
+      } catch (err) {
+        throw new Error("Could not access the Channel. Make sure the Channel ID is correct and you are a member of it.");
+      }
+    }
+    
     const sessionString = client.session.save();
     localStorage.setItem("tgDriveSession", sessionString);
     localStorage.setItem("tgDriveSessionType", "user");
     localStorage.removeItem("tgDriveBotToken");
-    localStorage.removeItem("tgDriveChannelId");
+    
+    if (window._userChannelId) {
+      localStorage.setItem("tgDriveChannelId", window._userChannelId);
+    } else {
+      localStorage.removeItem("tgDriveChannelId");
+    }
     
     currentUser = {
       id: me.id.toString(),
@@ -599,13 +619,13 @@ async function verifyCode() {
     if (e.errorMessage === "SESSION_PASSWORD_NEEDED" || e.message?.includes("password")) {
       show("password-group");
       el("password-input").focus();
-      showErr("2FA password required");
+      showErr(e.message || "2FA Password Required");
     } else {
-      showErr(e.message || "Verification failed");
+      showErr(e.message || "Invalid Code");
     }
+    btn.disabled = false;
+    btn.innerHTML = '<i class="fas fa-check"></i> Verify';
   }
-  btn.disabled = false;
-  btn.innerHTML = '<i class="fas fa-check"></i> Verify';
 }
 
 function backToPhone() { show("phone-step"); hide("code-step"); hide("password-group"); hide("auth-error"); }
@@ -673,6 +693,11 @@ async function loadFiles(folderId) {
         files = fileDatabase.files.filter(f => f.trashed);
       } else if (currentView === "starred") {
         files = fileDatabase.files.filter(f => !f.trashed && f.starred);
+      } else if (currentView === "recent") {
+        folders = [];
+        files = fileDatabase.files.filter(f => !f.trashed)
+          .sort((a, b) => new Date(b.uploadDate) - new Date(a.uploadDate))
+          .slice(0, 30);
       } else if (["images", "videos", "audio", "documents"].includes(currentView)) {
         const typeMap = { images: "image", videos: "video", audio: "audio", documents: "document" };
         files = fileDatabase.files.filter(f => !f.trashed && f.type === typeMap[currentView]);
@@ -681,7 +706,7 @@ async function loadFiles(folderId) {
       }
     }
 
-    files.sort((a, b) => {
+    if (currentView !== "recent") files.sort((a, b) => {
       let valA, valB;
       switch (sortBy) {
         case "name": valA = a.name.toLowerCase(); valB = b.name.toLowerCase(); break;
@@ -729,7 +754,7 @@ async function loadFiles(folderId) {
 
 function renderBreadcrumb(bc) {
   if (!bc) bc = [{ id: "root", name: "My Drive" }];
-  const viewNames = { files: "My Drive", recent: "Recent", starred: "Starred", images: "Images", videos: "Videos", audio: "Audio", documents: "Documents", trash: "Trash" };
+  const viewNames = { files: "My Drive", recent: "Recent", starred: "Starred", images: "Images", videos: "Videos", audio: "Audio", documents: "Documents", telegram: "Telegram Files", trash: "Trash" };
   if (currentView !== "files") {
     el("breadcrumb").innerHTML = `<a href="#" onclick="window.switchView('${currentView}')">${viewNames[currentView] || currentView}</a>`;
     return;
@@ -744,7 +769,7 @@ function renderFolders(folders) {
   g.className = `file-grid ${viewMode === "list" ? "list-view" : ""}`;
   g.innerHTML = folders.map(f => {
     const color = f.color || "#ffab00";
-    return `<div class="file-card${selectedItems.has(f.id) ? ' selected' : ''}" ondblclick="window.navFolder('${f.id}')" onclick="window.handleCardClick(event,'${f.id}','folder')" oncontextmenu="window.showContext(event,'folder','${f.id}')">
+    return `<div class="file-card${selectedItems.has(f.id) ? ' selected' : ''}" data-id="${f.id}" ondblclick="window.navFolder('${f.id}')" onclick="window.handleCardClick(event,'${f.id}','folder')" oncontextmenu="window.showContext(event,'folder','${f.id}')">
       <div class="card-checkbox" onclick="event.stopPropagation();window.toggleSelect('${f.id}','folder')"><i class="fas fa-check"></i></div>
       <div class="file-icon folder" style="background:${color}18;color:${color}"><i class="fas fa-folder"></i></div>
       ${viewMode === "list" ? `<div class="file-info"><div class="file-name" title="${esc(f.name)}">${esc(f.name)}</div><div class="file-meta">Folder</div><div class="file-date">${fmtDate(f.createdDate)}</div></div>` : `<div class="file-name" title="${esc(f.name)}">${esc(f.name)}</div><div class="file-meta">Folder</div>`}
@@ -771,13 +796,13 @@ function renderFiles(files) {
           if (url) {
             container.innerHTML = `<img src="${url}" alt="${esc(f.name)}" loading="lazy" onerror="this.parentElement.style.display='none'">`;
           } else {
-            container.innerHTML = `<div class="file-icon image"><i class="${fileIcon('image')}"></i></div>`;
+            container.innerHTML = `<div class="file-icon image"><i class="${fileIcon('image')}"><i class="${fileIcon('image')}"></i></div>`;
           }
         }
       }, 0);
     }
     
-    return `<div class="file-card${selectedItems.has(f.id) ? ' selected' : ''}" onclick="window.handleCardClick(event,'${f.id}','file')" ondblclick="window.previewFile('${f.id}')" oncontextmenu="window.showContext(event,'file','${f.id}')">
+    return `<div class="file-card${selectedItems.has(f.id) ? ' selected' : ''}" data-id="${f.id}" onclick="window.handleCardClick(event,'${f.id}','file')" ondblclick="window.previewFile('${f.id}')" oncontextmenu="window.showContext(event,'file','${f.id}')">
       <div class="card-checkbox" onclick="event.stopPropagation();window.toggleSelect('${f.id}','file')"><i class="fas fa-check"></i></div>
       <div class="file-star ${starred}" onclick="event.stopPropagation();window.toggleStar('${f.id}')" title="Star"><i class="fas fa-star"></i></div>
       ${thumbHtml}${iconHtml}
@@ -790,30 +815,70 @@ function renderFiles(files) {
 // ==================== UPLOAD ====================
 async function handleUpload(event) {
   const files = event.target.files; if (!files?.length) return;
-  const panel = el("upload-panel"), list = el("upload-list");
+  // webkitRelativePath is set when a folder is picked via the folder input ("MyFolder/sub/file.txt")
+  const entries = [...files].map(f => ({ file: f, relativePath: f.webkitRelativePath || "" }));
+  event.target.value = "";
+  await uploadEntries(entries);
+}
+
+// Walks pathParts from baseFolderId, reusing existing folders or creating missing ones.
+// Returns the id of the deepest folder.
+function ensureFolderPath(pathParts, baseFolderId) {
+  let parentId = baseFolderId;
+  for (const rawName of pathParts) {
+    const name = rawName.trim();
+    if (!name) continue;
+    let folder = fileDatabase.folders.find(f => f.parentId === parentId && f.name.toLowerCase() === name.toLowerCase() && !f.trashed);
+    if (!folder) {
+      folder = {
+        id: Date.now().toString(36) + Math.random().toString(36).substr(2, 9),
+        name,
+        parentId,
+        createdDate: new Date().toISOString(),
+        color: FOLDER_COLORS[Math.floor(Math.random() * FOLDER_COLORS.length)]
+      };
+      fileDatabase.folders.push(folder);
+    }
+    parentId = folder.id;
+  }
+  return parentId;
+}
+
+async function uploadEntries(entries) {
+  if (!entries?.length) return;
+  const list = el("upload-list");
   show("upload-panel");
   list.innerHTML = "";
+  const baseFolderId = currentFolder;
 
   const items = [];
-  for (const f of files) {
+  for (const { file: f, relativePath } of entries) {
+    const displayName = relativePath || f.name;
     const item = document.createElement("div");
     item.className = "upload-item";
-    item.innerHTML = `<div class="upload-item-icon"><i class="${fileIcon(fileTypeFromMime(f.type, f.name))}"></i></div><div class="upload-item-info"><div class="upload-item-name">${esc(f.name)}</div><div class="upload-progress"><div class="upload-progress-bar" style="width:0%"></div></div><div class="upload-status">Preparing...</div></div>`;
+    item.innerHTML = `<div class="upload-item-icon"><i class="${fileIcon(fileTypeFromMime(f.type, f.name))}"></i></div><div class="upload-item-info"><div class="upload-item-name">${esc(displayName)}</div><div class="upload-progress"><div class="upload-progress-bar" style="width:0%"></div></div><div class="upload-status">Preparing...</div></div>`;
     list.appendChild(item);
-    items.push({ file: f, progressBar: item.querySelector(".upload-progress-bar"), statusLabel: item.querySelector(".upload-status") });
+    items.push({ file: f, relativePath, progressBar: item.querySelector(".upload-progress-bar"), statusLabel: item.querySelector(".upload-status") });
   }
 
   for (const item of items) {
     const f = item.file;
     try {
+      // Recreate the source folder structure and target the deepest folder
+      let destFolderId = baseFolderId;
+      if (item.relativePath) {
+        const parts = item.relativePath.split("/").slice(0, -1);
+        if (parts.length) destFolderId = ensureFolderPath(parts, baseFolderId);
+      }
+
       item.statusLabel.textContent = "Uploading... 0%";
       const arrayBuffer = await f.arrayBuffer();
       const buffer = Buffer.from(arrayBuffer);
       const customFile = new CustomFile(f.name, f.size, "", buffer);
-      
+
       const result = await client.sendFile(targetPeer, {
         file: customFile,
-        caption: `🗂 TG-Drive | ${f.name}`,
+        caption: `🗂 TG-Drive | ${item.relativePath || f.name}`,
         forceDocument: true,
         progressCallback: (progress) => {
           const pct = Math.round(progress * 100);
@@ -821,13 +886,13 @@ async function handleUpload(event) {
           item.statusLabel.textContent = `Uploading... ${pct}%`;
         }
       });
-      
+
       const fileEntry = {
         id: Date.now().toString(36) + Math.random().toString(36).substr(2, 9),
         name: f.name,
         size: f.size,
         mimeType: f.type || "application/octet-stream",
-        folderId: currentFolder,
+        folderId: destFolderId,
         messageId: result.id,
         chatId: targetPeer === "me" ? "me" : targetPeer.id.toString(),
         uploadDate: new Date().toISOString(),
@@ -835,14 +900,14 @@ async function handleUpload(event) {
         trashed: false,
         type: fileTypeFromMime(f.type, f.name)
       };
-      
+
       fileDatabase.files.push(fileEntry);
-      
+
       item.statusLabel.textContent = "✓ Complete";
       item.statusLabel.className = "upload-status success";
       item.progressBar.style.width = "100%";
       item.progressBar.style.background = "var(--success)";
-      
+
     } catch (e) {
       console.error(e);
       item.statusLabel.textContent = "✗ " + e.message;
@@ -853,13 +918,12 @@ async function handleUpload(event) {
 
   await saveDBToTelegram();
   loadFiles();
-  event.target.value = "";
   setTimeout(() => { hide("upload-panel"); list.innerHTML = ""; }, 5000);
 }
 
 // ==================== DOWNLOAD ====================
 async function downloadFile(id, name) {
-  const file = fileDatabase.files.find(f => f.id === id);
+  const file = fileDatabase.files.find(f => f.id === id) || allFiles.find(f => f.id === id);
   const finalName = name || file?.name || "download";
   toast(`Downloading "${finalName}"...`, "info");
   try {
@@ -993,16 +1057,60 @@ function toggleSelect(id) {
   updateSelectionUI();
 }
 
-function clearSelection() { selectedItems.clear(); updateSelectionUI(); }
+function handleTelegramCardClick(e, id) {
+  e.preventDefault();
+  toggleTelegramSelect(id);
+}
+
+function toggleTelegramSelect(id) {
+  if (selectedItems.has(id)) selectedItems.delete(id); else selectedItems.add(id);
+  updateTelegramSelectionUI();
+}
+
+function clearSelection() {
+  selectedItems.clear();
+  if (currentView === "telegram") {
+    updateTelegramSelectionUI();
+  } else {
+    updateSelectionUI();
+  }
+}
 
 function updateSelectionUI() {
   document.querySelectorAll(".file-card").forEach(c => {
-    const id = c.getAttribute("onclick")?.match(/'([^']+)'/)?.[1];
+    const id = c.getAttribute("data-id");
     if (id) c.classList.toggle("selected", selectedItems.has(id));
   });
-  if (selectedItems.size > 0) { show("selection-bar"); el("selection-count").textContent = selectedItems.size; }
-  else hide("selection-bar");
+  if (selectedItems.size > 0) {
+    show("selection-bar");
+    el("selection-count").textContent = selectedItems.size;
+    show("sel-btn-move");
+    show("sel-btn-star");
+    show("sel-btn-trash");
+    hide("sel-btn-tg-import");
+    hide("sel-btn-tg-delete");
+  } else {
+    hide("selection-bar");
+  }
   renderFolders(currentFolders); renderFiles(currentFiles);
+}
+
+function updateTelegramSelectionUI() {
+  document.querySelectorAll(".file-card").forEach(c => {
+    const id = c.getAttribute("data-id");
+    if (id) c.classList.toggle("selected", selectedItems.has(id));
+  });
+  if (selectedItems.size > 0) {
+    show("selection-bar");
+    el("selection-count").textContent = selectedItems.size;
+    hide("sel-btn-move");
+    hide("sel-btn-star");
+    hide("sel-btn-trash");
+    show("sel-btn-tg-import");
+    show("sel-btn-tg-delete");
+  } else {
+    hide("selection-bar");
+  }
 }
 
 async function bulkAction(action) {
@@ -1033,8 +1141,10 @@ async function bulkAction(action) {
           const isSharedDel = fileDatabase.files.filter(f => f.messageId === file.messageId).length > 1;
           if (!isSharedDel) {
             try {
-              await client.deleteMessages(targetPeer, [file.messageId], { revoke: true });
-            } catch (e) {}
+              await client.deleteMessages(targetPeer, [Number(file.messageId)], { revoke: true });
+            } catch (e) {
+              console.warn("Could not delete file message from Telegram in bulk action:", e);
+            }
           }
           fileDatabase.files = fileDatabase.files.filter(f => f.id !== id);
           break;
@@ -1098,9 +1208,9 @@ async function permDelete(id) {
     const isShared = fileDatabase.files.filter(f => f.messageId === file.messageId).length > 1;
     if (!isShared) {
       try {
-        await client.deleteMessages(targetPeer, [file.messageId], { revoke: true });
+        await client.deleteMessages(targetPeer, [Number(file.messageId)], { revoke: true });
       } catch (e) {
-        console.error(e);
+        console.warn("Could not delete file message from Telegram:", e);
       }
     }
     fileDatabase.files = fileDatabase.files.filter(f => f.id !== id);
@@ -1120,8 +1230,10 @@ async function emptyTrash() {
     const isShared = fileDatabase.files.filter(f => f.messageId === file.messageId).length > 1;
     if (!isShared) {
       try {
-        await client.deleteMessages(targetPeer, [file.messageId], { revoke: true });
-      } catch (e) {}
+        await client.deleteMessages(targetPeer, [Number(file.messageId)], { revoke: true });
+      } catch (e) {
+        console.warn("Could not delete file message from Telegram during emptyTrash:", e);
+      }
     }
   }
   fileDatabase.files = fileDatabase.files.filter(f => !f.trashed);
@@ -1232,8 +1344,10 @@ async function deleteFolder(id) {
     const isShared = fileDatabase.files.filter(f => f.messageId === file.messageId).length > 1;
     if (!isShared) {
       try {
-        await client.deleteMessages(targetPeer, [file.messageId], { revoke: true });
-      } catch (e) {}
+        await client.deleteMessages(targetPeer, [Number(file.messageId)], { revoke: true });
+      } catch (e) {
+        console.warn("Could not delete file message from Telegram during deleteFolder:", e);
+      }
     }
   }
   
@@ -1367,6 +1481,7 @@ function switchView(view) {
   currentView = view; updateNav(view);
   if (view === "files") { currentFolder = "root"; loadFiles(); }
   else if (view === "recent" || view === "starred" || view === "trash") loadFiles();
+  else if (view === "telegram") loadTelegramView(true);
   else loadFilteredView(view);
 }
 
@@ -1385,15 +1500,325 @@ async function loadFilteredView(type) {
   } catch (e) {}
 }
 
+// ==================== TELEGRAM FILES VIEW (raw channel / saved messages) ====================
+// Shows every media message in the storage chat — including files uploaded directly
+// from the Telegram app that are not tracked in the drive database ("Unlisted").
+let tgFiles = [];
+let tgCursor = 0;      // user session: offsetId for history pagination; bot: next message id to scan (downwards)
+let tgHasMore = false;
+let tgLoading = false;
+const TG_BATCH = 60;
+
+async function loadTelegramView(reset = true) {
+  if (reset) { tgFiles = []; tgCursor = 0; tgHasMore = true; }
+  clearSelection();
+  hide("folders-section"); hide("trash-bar"); hide("empty-state");
+  show("files-section");
+  renderBreadcrumb();
+  const g = el("files-grid");
+  g.className = `file-grid ${viewMode === "list" ? "list-view" : ""}`;
+  if (reset) {
+    el("file-count").textContent = "";
+    g.innerHTML = `<div style="grid-column:1/-1;display:flex;align-items:center;gap:10px;padding:24px;color:var(--text-2)"><div class="spinner"></div> Scanning Telegram for files...</div>`;
+  }
+  await fetchTelegramBatch();
+  renderTelegramView();
+}
+
+async function fetchTelegramBatch() {
+  if (tgLoading || !tgHasMore) return;
+  tgLoading = true;
+  try {
+    const isBot = localStorage.getItem("tgDriveSessionType") === "bot";
+    let messages = [];
+
+    if (!isBot) {
+      // User session: normal history pagination (saved messages or channel)
+      messages = await client.getMessages(targetPeer, { limit: TG_BATCH, offsetId: tgCursor || 0 });
+      if (!messages?.length || messages.length < TG_BATCH) tgHasMore = false;
+      if (messages?.length) tgCursor = messages[messages.length - 1].id;
+    } else {
+      // Bot session: bots cannot read channel history, so scan explicit message IDs downwards.
+      if (!tgCursor) {
+        // Find the current top message id by posting a silent probe and deleting it
+        const probe = await client.sendMessage(targetPeer, { message: "🔍 TG-Drive file scan (auto-deleted)", silent: true });
+        tgCursor = probe.id - 1;
+        try { await client.deleteMessages(targetPeer, [probe.id], { revoke: true }); } catch (err) {}
+      }
+      let found = 0, scannedCount = 0;
+      messages = [];
+      while (tgCursor >= 1 && found < TG_BATCH && scannedCount < 600) {
+        const from = Math.max(1, tgCursor - 99);
+        const ids = [];
+        for (let i = tgCursor; i >= from; i--) ids.push(i);
+        const batch = await client.getMessages(targetPeer, { ids });
+        for (const m of batch || []) {
+          if (m?.media) found++;
+          if (m) messages.push(m);
+        }
+        scannedCount += ids.length;
+        tgCursor = from - 1;
+      }
+      if (tgCursor < 1) tgHasMore = false;
+    }
+
+    for (const m of messages) {
+      const entry = m && messageToEntry(m);
+      if (entry && !tgFiles.some(f => f.messageId === entry.messageId)) tgFiles.push(entry);
+    }
+  } catch (e) {
+    console.error("Telegram file scan failed:", e);
+    toast("Could not load Telegram files: " + (e.message || e), "error");
+    tgHasMore = false;
+  }
+  tgLoading = false;
+}
+
+// Converts a raw Telegram message into a drive-compatible file entry
+function messageToEntry(msg) {
+  if (!msg?.media) return null;
+  if (msg.message?.includes("#TelegramDriveDatabase")) return null; // skip the database message
+
+  let name = "", size = 0, mime = "application/octet-stream";
+  if (msg.media.document) {
+    const doc = msg.media.document;
+    mime = doc.mimeType || mime;
+    size = Number(doc.size) || 0;
+    const nameAttr = doc.attributes?.find(a => a.fileName);
+    name = nameAttr?.fileName || `file_${msg.id}.${(mime.split("/")[1] || "bin").split(";")[0]}`;
+  } else if (msg.media.photo) {
+    mime = "image/jpeg";
+    name = `photo_${msg.id}.jpg`;
+    for (const s of msg.media.photo.sizes || []) {
+      if (typeof s.size === "number") size = Math.max(size, s.size);
+      else if (Array.isArray(s.sizes) && s.sizes.length) size = Math.max(size, Math.max(...s.sizes));
+    }
+  } else {
+    return null;
+  }
+
+  return {
+    id: "tg_" + msg.id,
+    name, size, mimeType: mime,
+    messageId: msg.id,
+    folderId: null,
+    uploadDate: new Date(msg.date * 1000).toISOString(),
+    starred: false, trashed: false,
+    type: fileTypeFromMime(mime, name),
+    caption: msg.message || "",
+    tracked: fileDatabase.files.some(f => f.messageId === msg.id && !f.trashed)
+  };
+}
+
+function renderTelegramView() {
+  // Point the shared caches at the raw entries so preview/download/thumbnails work
+  currentFiles = tgFiles; currentFolders = []; allFiles = tgFiles;
+  const g = el("files-grid");
+  g.className = `file-grid ${viewMode === "list" ? "list-view" : ""}`;
+  el("file-count").textContent = `${tgFiles.length}${tgHasMore ? "+" : ""} file${tgFiles.length !== 1 ? "s" : ""}`;
+
+  const cards = tgFiles.map(f => {
+    const isImage = f.type === "image";
+    const thumbHtml = isImage && viewMode !== "list" ? `<div class="file-thumb" id="thumb-${f.id}"><div class="spinner-sm"></div></div>` : "";
+    const iconHtml = (!isImage || viewMode === "list") ? `<div class="file-icon ${f.type}"><i class="${fileIcon(f.type)}"></i></div>` : "";
+
+    if (isImage && viewMode !== "list") {
+      setTimeout(async () => {
+        const url = await getFileObjectUrl(f.id, true);
+        const container = document.getElementById(`thumb-${f.id}`);
+        if (container) {
+          if (url) container.innerHTML = `<img src="${url}" alt="${esc(f.name)}" loading="lazy" onerror="this.parentElement.style.display='none'">`;
+          else container.innerHTML = `<div class="file-icon image"><i class="${fileIcon('image')}"></i></div>`;
+        }
+      }, 0);
+    }
+
+    const badge = f.tracked
+      ? `<span style="font-size:10px;font-weight:600;padding:1px 7px;border-radius:20px;background:rgba(0,214,143,.14);color:var(--success,#00d68f)">Listed</span>`
+      : `<span style="font-size:10px;font-weight:600;padding:1px 7px;border-radius:20px;background:rgba(255,171,0,.14);color:#ffab00">Unlisted</span>`;
+    const importBtn = f.tracked ? "" : `<button onclick="event.stopPropagation();window.importTelegramFile(${f.messageId})" title="Import to My Drive"><i class="fas fa-file-import"></i></button>`;
+    const meta = `${fmtBytes(f.size)} · ${fmtDate(f.uploadDate)}`;
+
+    return `<div class="file-card${selectedItems.has(f.id) ? ' selected' : ''}" data-id="${f.id}" onclick="window.handleTelegramCardClick(event,'${f.id}')" ondblclick="window.previewFile('${f.id}')" oncontextmenu="event.preventDefault()">
+      ${thumbHtml}${iconHtml}
+      ${viewMode === "list"
+        ? `<div class="file-info"><div class="file-name" title="${esc(f.name)}">${esc(f.name)} ${badge}</div><div class="file-meta">${fmtBytes(f.size)}</div><div class="file-date">${fmtDate(f.uploadDate)}</div></div>`
+        : `<div class="file-name" title="${esc(f.name)}">${esc(f.name)}</div><div class="file-meta">${meta} ${badge}</div>`}
+      <div class="card-actions">${importBtn}<button onclick="event.stopPropagation();window.downloadFile('${f.id}')" title="Download"><i class="fas fa-download"></i></button><button onclick="event.stopPropagation();window.deleteTelegramFile(${f.messageId})" title="Delete from Telegram"><i class="fas fa-trash"></i></button></div>
+    </div>`;
+  }).join("");
+
+  const loadMore = tgHasMore
+    ? `<div class="file-card" id="tg-load-more" onclick="window.loadMoreTelegramFiles()" style="display:flex;align-items:center;justify-content:center;gap:8px;cursor:pointer;color:var(--text-2);min-height:64px"><i class="fas fa-chevron-down"></i> Load more</div>`
+    : "";
+
+  g.innerHTML = cards + loadMore;
+  toggle("files-section", tgFiles.length > 0 || tgHasMore);
+  toggle("empty-state", tgFiles.length === 0 && !tgHasMore);
+}
+
+async function loadMoreTelegramFiles() {
+  if (tgLoading) return;
+  const btn = el("tg-load-more");
+  if (btn) btn.innerHTML = `<div class="spinner"></div> Scanning...`;
+  await fetchTelegramBatch();
+  renderTelegramView();
+}
+
+// Adds an untracked ("unlisted") Telegram file to the drive database so it appears in My Drive
+async function importTelegramFile(messageId) {
+  const src = tgFiles.find(f => f.messageId === messageId);
+  if (!src) return;
+  if (fileDatabase.files.some(f => f.messageId === messageId && !f.trashed)) {
+    src.tracked = true;
+    renderTelegramView();
+    return toast("Already in My Drive", "info");
+  }
+  fileDatabase.files.push({
+    id: Date.now().toString(36) + Math.random().toString(36).substr(2, 9),
+    name: src.name,
+    size: src.size,
+    mimeType: src.mimeType,
+    folderId: "root",
+    messageId,
+    chatId: targetPeer === "me" ? "me" : targetPeer.id.toString(),
+    uploadDate: src.uploadDate,
+    starred: false,
+    trashed: false,
+    type: src.type
+  });
+  src.tracked = true;
+  await saveDBToTelegram();
+  renderTelegramView();
+  toast(`"${src.name}" imported to My Drive`, "success");
+}
+
+// Deletes a Telegram file: listed files are also removed from the drive database (filedb.json),
+// unlisted files are just deleted from the chat directly
+async function deleteTelegramFile(messageId) {
+  const src = tgFiles.find(f => Number(f.messageId) === Number(messageId));
+  if (!src) return;
+  const tracked = fileDatabase.files.some(f => Number(f.messageId) === Number(messageId));
+  const ok = await customConfirm(
+    "Delete from Telegram",
+    tracked
+      ? `"${src.name}" will be permanently deleted from Telegram and removed from My Drive. This cannot be undone.`
+      : `"${src.name}" will be permanently deleted from Telegram. This cannot be undone.`,
+    "Delete Forever"
+  );
+  if (!ok) return;
+  try {
+    await client.deleteMessages(targetPeer, [Number(messageId)], { revoke: true });
+  } catch (e) {
+    console.warn("Could not delete message from Telegram:", e);
+    toast("Warning: Could not delete from Telegram: " + (e.message || e), "warning");
+  }
+  if (tracked) {
+    fileDatabase.files = fileDatabase.files.filter(f => Number(f.messageId) !== Number(messageId));
+    await saveDBToTelegram();
+  }
+  tgFiles = tgFiles.filter(f => Number(f.messageId) !== Number(messageId));
+  renderTelegramView();
+  toast(`"${src.name}" deleted`, "success");
+}
+
+async function bulkImportTelegramFiles() {
+  const ids = [...selectedItems];
+  if (!ids.length) return;
+  
+  let importedCount = 0;
+  for (const id of ids) {
+    const src = tgFiles.find(f => f.id === id);
+    if (!src || src.tracked) continue;
+    
+    fileDatabase.files.push({
+      id: Date.now().toString(36) + Math.random().toString(36).substr(2, 9),
+      name: src.name,
+      size: src.size,
+      mimeType: src.mimeType,
+      folderId: "root",
+      messageId: Number(src.messageId),
+      chatId: targetPeer === "me" ? "me" : targetPeer.id.toString(),
+      uploadDate: src.uploadDate,
+      starred: false,
+      trashed: false,
+      type: src.type
+    });
+    src.tracked = true;
+    importedCount++;
+  }
+  
+  if (importedCount > 0) {
+    await saveDBToTelegram();
+    toast(`${importedCount} files imported to My Drive`, "success");
+  }
+  clearSelection();
+  renderTelegramView();
+}
+
+async function bulkDeleteTelegramFiles() {
+  const ids = [...selectedItems];
+  if (!ids.length) return;
+  
+  const ok = await customConfirm(
+    "Delete from Telegram",
+    `Delete ${ids.length} selected files permanently from Telegram? This cannot be undone.`,
+    "Delete Forever"
+  );
+  if (!ok) return;
+  
+  const msgIdsToDelete = [];
+  const trackedMsgIds = [];
+  
+  for (const id of ids) {
+    const src = tgFiles.find(f => f.id === id);
+    if (src) {
+      msgIdsToDelete.push(Number(src.messageId));
+      if (src.tracked) {
+        trackedMsgIds.push(Number(src.messageId));
+      }
+    }
+  }
+  
+  if (!msgIdsToDelete.length) return;
+  
+  try {
+    const batchSize = 100;
+    for (let i = 0; i < msgIdsToDelete.length; i += batchSize) {
+      const batch = msgIdsToDelete.slice(i, i + batchSize);
+      try {
+        await client.deleteMessages(targetPeer, batch, { revoke: true });
+      } catch (e) {
+        console.warn("Could not delete some messages from Telegram during bulk delete:", e);
+      }
+    }
+  } catch (e) {
+    console.error("Bulk delete failed:", e);
+  }
+  
+  if (trackedMsgIds.length > 0) {
+    fileDatabase.files = fileDatabase.files.filter(f => !trackedMsgIds.includes(Number(f.messageId)));
+    await saveDBToTelegram();
+  }
+  
+  tgFiles = tgFiles.filter(f => !msgIdsToDelete.includes(Number(f.messageId)));
+  
+  clearSelection();
+  renderTelegramView();
+  toast(`${msgIdsToDelete.length} files deleted`, "success");
+}
+
 function toggleView() {
   viewMode = viewMode === "grid" ? "list" : "grid";
   el("view-toggle").innerHTML = viewMode === "grid" ? '<i class="fas fa-th-large"></i>' : '<i class="fas fa-list"></i>';
+  if (currentView === "telegram") { renderTelegramView(); return; }
   renderFolders(currentFolders); renderFiles(currentFiles);
 }
 
 function refreshFiles() {
   const btn = event?.target?.closest?.(".btn-icon");
   if (btn) { btn.style.transform = "rotate(360deg)"; btn.style.transition = "transform .5s ease"; setTimeout(() => { btn.style.transform = ""; }, 500); }
+  if (currentView === "telegram") { loadTelegramView(true); toast("Refreshed", "info"); return; }
   loadFiles(); toast("Refreshed", "info");
 }
 
@@ -1403,9 +1828,37 @@ function setupDragDrop() {
   document.addEventListener("dragenter", e => { e.preventDefault(); dragCounter++; dz.classList.add("active"); });
   document.addEventListener("dragleave", e => { e.preventDefault(); dragCounter--; if (!dragCounter) dz.classList.remove("active"); });
   document.addEventListener("dragover", e => e.preventDefault());
-  document.addEventListener("drop", e => {
+  document.addEventListener("drop", async e => {
     e.preventDefault(); dragCounter = 0; dz.classList.remove("active");
-    if (e.dataTransfer.files.length) { const inp = el("file-upload"); inp.files = e.dataTransfer.files; handleUpload({ target: inp }); }
+    const dt = e.dataTransfer;
+    if (dt.items?.length && typeof dt.items[0].webkitGetAsEntry === "function") {
+      // Grab entries synchronously — dataTransfer items become invalid after an await
+      const roots = [...dt.items].map(i => i.webkitGetAsEntry()).filter(Boolean);
+      const collected = [];
+      for (const entry of roots) await collectDroppedEntries(entry, "", collected);
+      if (collected.length) uploadEntries(collected);
+    } else if (dt.files.length) {
+      uploadEntries([...dt.files].map(f => ({ file: f, relativePath: "" })));
+    }
+  });
+}
+
+// Recursively reads a dropped FileSystemEntry (file or directory) into {file, relativePath} pairs
+function collectDroppedEntries(entry, basePath, out) {
+  return new Promise(resolve => {
+    if (entry.isFile) {
+      entry.file(f => { out.push({ file: f, relativePath: basePath ? basePath + f.name : "" }); resolve(); }, () => resolve());
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      const readBatch = () => {
+        reader.readEntries(async batch => {
+          if (!batch.length) return resolve();
+          for (const child of batch) await collectDroppedEntries(child, basePath + entry.name + "/", out);
+          readBatch(); // readEntries returns at most ~100 entries per call
+        }, () => resolve());
+      };
+      readBatch();
+    } else resolve();
   });
 }
 
@@ -1441,7 +1894,7 @@ function toggle(id, show) { show ? el(id)?.classList.remove("hidden") : el(id)?.
 function closeModal(id) { hide(id); }
 function toggleSidebar() { el("sidebar").classList.toggle("open"); }
 function toggleUploadPanel() { el("upload-panel").classList.toggle("hidden"); }
-function esc(s) { if (!s) return ""; const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+function esc(s) { if (!s) return ""; const d = document.createElement("div"); d.textContent = s; return d.innerHTML.replace(/"/g, "&quot;").replace(/'/g, "&#39;"); }
 function escCode(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 
 function fmtBytes(b) {
@@ -1545,6 +1998,12 @@ window.clearSearch = clearSearch;
 window.handleSort = handleSort;
 window.toggleView = toggleView;
 window.refreshFiles = refreshFiles;
+window.loadMoreTelegramFiles = loadMoreTelegramFiles;
+window.importTelegramFile = importTelegramFile;
+window.deleteTelegramFile = deleteTelegramFile;
+window.handleTelegramCardClick = handleTelegramCardClick;
+window.bulkImportTelegramFiles = bulkImportTelegramFiles;
+window.bulkDeleteTelegramFiles = bulkDeleteTelegramFiles;
 window.okConfirm = okConfirm;
 window.cancelConfirm = cancelConfirm;
 window.showShortcutsModal = showShortcutsModal;
