@@ -3,6 +3,7 @@ import { StringSession } from "telegram/sessions";
 import { CustomFile } from "telegram/client/uploads";
 import { computeCheck } from "telegram/Password";
 import { Buffer } from "buffer";
+import { zip } from "fflate";
 
 let client = null;
 let targetPeer = "me";
@@ -660,6 +661,29 @@ function customConfirm(title, message, okText = "Confirm", type = "danger") {
     const icon = el("confirm-icon");
     icon.className = `confirm-icon ${type}`;
     icon.innerHTML = type === "danger" ? '<i class="fas fa-exclamation-triangle"></i>' : '<i class="fas fa-question-circle"></i>';
+    el("confirm-cancel-btn").style.display = "inline-block";
+    show("confirm-modal");
+  });
+}
+function customAlert(title, message, okText = "OK", type = "warning") {
+  return new Promise(resolve => {
+    confirmResolve = resolve;
+    el("confirm-title").textContent = title;
+    el("confirm-message").textContent = message;
+    el("confirm-ok-btn").textContent = okText;
+    el("confirm-ok-btn").className = `btn ${type === "danger" ? "btn-danger" : "btn-primary"}`;
+    const icon = el("confirm-icon");
+    icon.className = `confirm-icon ${type}`;
+    icon.innerHTML = type === "danger" ? '<i class="fas fa-exclamation-triangle"></i>' : (type === "warning" ? '<i class="fas fa-exclamation-circle"></i>' : '<i class="fas fa-info-circle"></i>');
+    
+    const cancelBtn = el("confirm-cancel-btn");
+    cancelBtn.style.display = "none";
+    
+    confirmResolve = (val) => {
+      cancelBtn.style.display = "inline-block";
+      resolve(val);
+    };
+    
     show("confirm-modal");
   });
 }
@@ -844,6 +868,10 @@ function ensureFolderPath(pathParts, baseFolderId) {
   return parentId;
 }
 
+// How many files upload simultaneously. Higher = faster for many small files,
+// but too high risks Telegram FLOOD_WAIT rate limits and high memory usage.
+const MAX_PARALLEL_UPLOADS = 4;
+
 async function uploadEntries(entries) {
   if (!entries?.length) return;
   const list = el("upload-list");
@@ -861,64 +889,75 @@ async function uploadEntries(entries) {
     items.push({ file: f, relativePath, progressBar: item.querySelector(".upload-progress-bar"), statusLabel: item.querySelector(".upload-status") });
   }
 
-  for (const item of items) {
-    const f = item.file;
-    try {
-      // Recreate the source folder structure and target the deepest folder
-      let destFolderId = baseFolderId;
-      if (item.relativePath) {
-        const parts = item.relativePath.split("/").slice(0, -1);
-        if (parts.length) destFolderId = ensureFolderPath(parts, baseFolderId);
-      }
-
-      item.statusLabel.textContent = "Uploading... 0%";
-      const arrayBuffer = await f.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
-      const customFile = new CustomFile(f.name, f.size, "", buffer);
-
-      const result = await client.sendFile(targetPeer, {
-        file: customFile,
-        caption: `🗂 TG-Drive | ${item.relativePath || f.name}`,
-        forceDocument: true,
-        progressCallback: (progress) => {
-          const pct = Math.round(progress * 100);
-          item.progressBar.style.width = pct + "%";
-          item.statusLabel.textContent = `Uploading... ${pct}%`;
-        }
-      });
-
-      const fileEntry = {
-        id: Date.now().toString(36) + Math.random().toString(36).substr(2, 9),
-        name: f.name,
-        size: f.size,
-        mimeType: f.type || "application/octet-stream",
-        folderId: destFolderId,
-        messageId: result.id,
-        chatId: targetPeer === "me" ? "me" : targetPeer.id.toString(),
-        uploadDate: new Date().toISOString(),
-        starred: false,
-        trashed: false,
-        type: fileTypeFromMime(f.type, f.name)
-      };
-
-      fileDatabase.files.push(fileEntry);
-
-      item.statusLabel.textContent = "✓ Complete";
-      item.statusLabel.className = "upload-status success";
-      item.progressBar.style.width = "100%";
-      item.progressBar.style.background = "var(--success)";
-
-    } catch (e) {
-      console.error(e);
-      item.statusLabel.textContent = "✗ " + e.message;
-      item.statusLabel.className = "upload-status error";
-      toast(`Upload failed for ${f.name}`, "error");
+  // Worker pool: run up to MAX_PARALLEL_UPLOADS uploads concurrently,
+  // each worker pulling the next pending file until the queue is empty.
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(MAX_PARALLEL_UPLOADS, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const item = items[nextIndex++];
+      await uploadSingleEntry(item, baseFolderId);
     }
-  }
+  });
+  await Promise.all(workers);
 
   await saveDBToTelegram();
   loadFiles();
   setTimeout(() => { hide("upload-panel"); list.innerHTML = ""; }, 5000);
+}
+
+async function uploadSingleEntry(item, baseFolderId) {
+  const f = item.file;
+  try {
+    // Recreate the source folder structure and target the deepest folder
+    let destFolderId = baseFolderId;
+    if (item.relativePath) {
+      const parts = item.relativePath.split("/").slice(0, -1);
+      if (parts.length) destFolderId = ensureFolderPath(parts, baseFolderId);
+    }
+
+    item.statusLabel.textContent = "Uploading... 0%";
+    const arrayBuffer = await f.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    const customFile = new CustomFile(f.name, f.size, "", buffer);
+
+    const result = await client.sendFile(targetPeer, {
+      file: customFile,
+      caption: `🗂 TG-Drive | ${item.relativePath || f.name}`,
+      forceDocument: true,
+      progressCallback: (progress) => {
+        const pct = Math.round(progress * 100);
+        item.progressBar.style.width = pct + "%";
+        item.statusLabel.textContent = `Uploading... ${pct}%`;
+      }
+    });
+
+    const fileEntry = {
+      id: Date.now().toString(36) + Math.random().toString(36).substr(2, 9),
+      name: f.name,
+      size: f.size,
+      mimeType: f.type || "application/octet-stream",
+      folderId: destFolderId,
+      messageId: result.id,
+      chatId: targetPeer === "me" ? "me" : targetPeer.id.toString(),
+      uploadDate: new Date().toISOString(),
+      starred: false,
+      trashed: false,
+      type: fileTypeFromMime(f.type, f.name)
+    };
+
+    fileDatabase.files.push(fileEntry);
+
+    item.statusLabel.textContent = "✓ Complete";
+    item.statusLabel.className = "upload-status success";
+    item.progressBar.style.width = "100%";
+    item.progressBar.style.background = "var(--success)";
+
+  } catch (e) {
+    console.error(e);
+    item.statusLabel.textContent = "✗ " + e.message;
+    item.statusLabel.className = "upload-status error";
+    toast(`Upload failed for ${f.name}`, "error");
+  }
 }
 
 // ==================== DOWNLOAD ====================
@@ -940,6 +979,125 @@ async function downloadFile(id, name) {
   } catch (e) {
     toast("Download failed: " + e.message, "error");
   }
+}
+
+// ==================== FOLDER DOWNLOAD (ZIP) ====================
+// How many files to fetch from Telegram at the same time while zipping
+const MAX_PARALLEL_DOWNLOADS = 4;
+
+// Fetches the raw bytes of a stored file straight from Telegram (no object-URL caching,
+// so big folders don't pile up blobs in memory)
+async function downloadFileBuffer(file) {
+  const messages = await client.getMessages(targetPeer, { ids: [file.messageId] });
+  if (!messages?.[0]) throw new Error("Message not found on Telegram");
+  const buffer = await client.downloadMedia(messages[0], {});
+  if (!buffer) throw new Error("Download failed");
+  return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+}
+
+async function downloadFolder(id) {
+  hideContext();
+  const rootFolder = fileDatabase.folders.find(f => f.id === id);
+  if (!rootFolder) return;
+
+  // Collect every file in this folder and all subfolders, with their path inside the zip
+  const subIds = getAllSubFolderIds(id);
+  const pathCache = new Map();
+  const folderPath = (folderId) => {
+    if (pathCache.has(folderId)) return pathCache.get(folderId);
+    const parts = [];
+    let cur = fileDatabase.folders.find(f => f.id === folderId);
+    while (cur && cur.id !== id) {
+      parts.unshift(cur.name);
+      cur = fileDatabase.folders.find(f => f.id === cur.parentId);
+    }
+    const p = parts.length ? parts.join("/") + "/" : "";
+    pathCache.set(folderId, p);
+    return p;
+  };
+
+  const files = fileDatabase.files.filter(f => !f.trashed && subIds.includes(f.folderId));
+  if (!files.length) return toast("Folder is empty", "warning");
+
+  // Show progress in the upload panel
+  const list = el("upload-list");
+  show("upload-panel");
+  const item = document.createElement("div");
+  item.className = "upload-item";
+  item.innerHTML = `<div class="upload-item-icon"><i class="fas fa-file-archive"></i></div><div class="upload-item-info"><div class="upload-item-name">${esc(rootFolder.name)}.zip</div><div class="upload-progress"><div class="upload-progress-bar" style="width:0%"></div></div><div class="upload-status">Downloading 0/${files.length} files...</div></div>`;
+  list.appendChild(item);
+  const progressBar = item.querySelector(".upload-progress-bar");
+  const statusLabel = item.querySelector(".upload-status");
+
+  toast(`Preparing "${rootFolder.name}.zip" (${files.length} files)...`, "info");
+
+  try {
+    const zipInput = {};
+    const usedNames = new Set();
+    let done = 0, failed = 0;
+
+    // Worker pool: fetch several files from Telegram concurrently
+    let nextIndex = 0;
+    const workers = Array.from({ length: Math.min(MAX_PARALLEL_DOWNLOADS, files.length) }, async () => {
+      while (nextIndex < files.length) {
+        const file = files[nextIndex++];
+        try {
+          const data = await downloadFileBuffer(file);
+          // De-duplicate identical paths inside the zip ("name.txt" -> "name (2).txt")
+          let path = folderPath(file.folderId) + file.name;
+          let n = 2;
+          while (usedNames.has(path.toLowerCase())) {
+            const dot = file.name.lastIndexOf(".");
+            const renamed = dot > 0 ? `${file.name.slice(0, dot)} (${n})${file.name.slice(dot)}` : `${file.name} (${n})`;
+            path = folderPath(file.folderId) + renamed;
+            n++;
+          }
+          usedNames.add(path.toLowerCase());
+          // Level 0 = store without recompressing; media files are already compressed
+          zipInput[path] = [data, { level: 0 }];
+        } catch (e) {
+          console.error(`Could not download "${file.name}" for zip:`, e);
+          failed++;
+        }
+        done++;
+        const pct = Math.round(done / files.length * 90);
+        progressBar.style.width = pct + "%";
+        statusLabel.textContent = `Downloading ${done}/${files.length} files...`;
+      }
+    });
+    await Promise.all(workers);
+
+    if (!Object.keys(zipInput).length) throw new Error("No files could be downloaded");
+
+    statusLabel.textContent = "Creating zip...";
+    const zipped = await new Promise((resolve, reject) => {
+      zip(zipInput, { level: 0 }, (err, data) => err ? reject(err) : resolve(data));
+    });
+
+    const blob = new Blob([zipped], { type: "application/zip" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = rootFolder.name + ".zip";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+
+    progressBar.style.width = "100%";
+    progressBar.style.background = "var(--success)";
+    statusLabel.textContent = failed ? `✓ Done (${failed} file${failed !== 1 ? "s" : ""} failed)` : "✓ Complete";
+    statusLabel.className = "upload-status success";
+    toast(failed ? `"${rootFolder.name}.zip" downloaded (${failed} failed)` : `"${rootFolder.name}.zip" downloaded`, failed ? "warning" : "success");
+  } catch (e) {
+    console.error("Folder download failed:", e);
+    progressBar.style.background = "var(--danger)";
+    statusLabel.textContent = "✗ " + e.message;
+    statusLabel.className = "upload-status error";
+    toast("Folder download failed: " + e.message, "error");
+  }
+
+  setTimeout(() => { item.remove(); if (!list.children.length) hide("upload-panel"); }, 8000);
 }
 
 // ==================== PREVIEW ====================
@@ -1028,6 +1186,7 @@ function showContext(e, type, id) {
             <button class="ctx-item danger" onclick="window.trashFile('${id}')"><i class="fas fa-trash"></i>Move to Trash<span class="shortcut">Del</span></button>`;
   } else if (type === "folder") {
     html = `<button class="ctx-item" onclick="window.navFolder('${id}')"><i class="fas fa-folder-open"></i>Open</button>
+            <button class="ctx-item" onclick="window.downloadFolder('${id}')"><i class="fas fa-file-archive"></i>Download as ZIP</button>
             <div class="ctx-divider"></div>
             <button class="ctx-item" onclick="window.showRename('folder','${id}')"><i class="fas fa-edit"></i>Rename</button>
             <button class="ctx-item" onclick="window.showMoveModal(['${id}'],'folder')"><i class="fas fa-arrows-alt"></i>Move to</button>
@@ -1118,6 +1277,33 @@ async function bulkAction(action) {
   if (!ids.length) return;
   if (action === "move") { showMoveModal(ids, "mixed"); return; }
   
+  if (action === "delete") {
+    const isBot = localStorage.getItem("tgDriveSessionType") === "bot";
+    if (isBot) {
+      const now = new Date();
+      const restrictedFiles = [];
+      for (const id of ids) {
+        const file = fileDatabase.files.find(f => f.id === id);
+        if (file) {
+          const uploadDate = new Date(file.uploadDate);
+          const diffHours = (now - uploadDate) / (1000 * 60 * 60);
+          if (diffHours > 48) {
+            restrictedFiles.push(file.name);
+          }
+        }
+      }
+      if (restrictedFiles.length > 0) {
+        await customAlert(
+          "Cannot Delete Files",
+          `Some selected files (such as "${restrictedFiles[0]}") were uploaded more than 48 hours ago. Bots cannot delete files older than 48 hours on Telegram. Please log in with a User account to delete them.`,
+          "Got it",
+          "warning"
+        );
+        return;
+      }
+    }
+  }
+  
   for (const id of ids) {
     const file = fileDatabase.files.find(f => f.id === id);
     if (file) {
@@ -1201,10 +1387,24 @@ async function restoreFile(id) {
 }
 
 async function permDelete(id) {
-  const ok = await customConfirm("Delete Forever", "This file will be permanently deleted. This action cannot be undone.", "Delete Forever");
-  if (!ok) return;
   const file = fileDatabase.files.find(f => f.id === id);
   if (file) {
+    const isBot = localStorage.getItem("tgDriveSessionType") === "bot";
+    if (isBot) {
+      const uploadDate = new Date(file.uploadDate);
+      const diffHours = (new Date() - uploadDate) / (1000 * 60 * 60);
+      if (diffHours > 48) {
+        await customAlert(
+          "Cannot Delete File",
+          `This file was uploaded more than 48 hours ago. Bots cannot delete files older than 48 hours on Telegram. Please log in with a User account to delete this file.`,
+          "Got it",
+          "warning"
+        );
+        return;
+      }
+    }
+    const ok = await customConfirm("Delete Forever", "This file will be permanently deleted. This action cannot be undone.", "Delete Forever");
+    if (!ok) return;
     const isShared = fileDatabase.files.filter(f => f.messageId === file.messageId).length > 1;
     if (!isShared) {
       try {
@@ -1222,10 +1422,31 @@ async function permDelete(id) {
 }
 
 async function emptyTrash() {
+  const trashedFiles = fileDatabase.files.filter(f => f.trashed);
+  if (trashedFiles.length === 0) return;
+  
+  const isBot = localStorage.getItem("tgDriveSessionType") === "bot";
+  if (isBot) {
+    const now = new Date();
+    const restrictedFiles = trashedFiles.filter(file => {
+      const uploadDate = new Date(file.uploadDate);
+      const diffHours = (now - uploadDate) / (1000 * 60 * 60);
+      return diffHours > 48;
+    });
+    if (restrictedFiles.length > 0) {
+      await customAlert(
+        "Cannot Empty Trash",
+        `Trash contains ${restrictedFiles.length} file(s) uploaded more than 48 hours ago. Bots cannot delete files older than 48 hours on Telegram. Please log in with a User account to empty the trash.`,
+        "Got it",
+        "warning"
+      );
+      return;
+    }
+  }
+
   const ok = await customConfirm("Empty Trash", "All items in trash will be permanently deleted. This cannot be undone.", "Empty Trash");
   if (!ok) return;
   
-  const trashedFiles = fileDatabase.files.filter(f => f.trashed);
   for (const file of trashedFiles) {
     const isShared = fileDatabase.files.filter(f => f.messageId === file.messageId).length > 1;
     if (!isShared) {
@@ -1335,11 +1556,31 @@ function getAllSubFolderIds(parentId) {
 }
 
 async function deleteFolder(id) {
+  const subIds = getAllSubFolderIds(id);
+  const filesToDelete = fileDatabase.files.filter(f => subIds.includes(f.folderId));
+  
+  const isBot = localStorage.getItem("tgDriveSessionType") === "bot";
+  if (isBot && filesToDelete.length > 0) {
+    const now = new Date();
+    const restrictedFiles = filesToDelete.filter(file => {
+      const uploadDate = new Date(file.uploadDate);
+      const diffHours = (now - uploadDate) / (1000 * 60 * 60);
+      return diffHours > 48;
+    });
+    if (restrictedFiles.length > 0) {
+      await customAlert(
+        "Cannot Delete Folder",
+        `This folder contains ${restrictedFiles.length} file(s) uploaded more than 48 hours ago. Bots cannot delete files older than 48 hours on Telegram. Please log in with a User account to delete this folder.`,
+        "Got it",
+        "warning"
+      );
+      return;
+    }
+  }
+
   const ok = await customConfirm("Delete Folder", "This folder and all its contents will be permanently deleted.", "Delete Folder");
   if (!ok) return;
   
-  const subIds = getAllSubFolderIds(id);
-  const filesToDelete = fileDatabase.files.filter(f => subIds.includes(f.folderId));
   for (const file of filesToDelete) {
     const isShared = fileDatabase.files.filter(f => f.messageId === file.messageId).length > 1;
     if (!isShared) {
@@ -1698,6 +1939,22 @@ async function importTelegramFile(messageId) {
 async function deleteTelegramFile(messageId) {
   const src = tgFiles.find(f => Number(f.messageId) === Number(messageId));
   if (!src) return;
+  
+  const isBot = localStorage.getItem("tgDriveSessionType") === "bot";
+  if (isBot) {
+    const uploadDate = new Date(src.uploadDate);
+    const diffHours = (new Date() - uploadDate) / (1000 * 60 * 60);
+    if (diffHours > 48) {
+      await customAlert(
+        "Cannot Delete File",
+        `This file was uploaded more than 48 hours ago. Bots cannot delete files older than 48 hours on Telegram. Please log in with a User account to delete this file.`,
+        "Got it",
+        "warning"
+      );
+      return;
+    }
+  }
+
   const tracked = fileDatabase.files.some(f => Number(f.messageId) === Number(messageId));
   const ok = await customConfirm(
     "Delete from Telegram",
@@ -1759,6 +2016,31 @@ async function bulkImportTelegramFiles() {
 async function bulkDeleteTelegramFiles() {
   const ids = [...selectedItems];
   if (!ids.length) return;
+  
+  const isBot = localStorage.getItem("tgDriveSessionType") === "bot";
+  if (isBot) {
+    const now = new Date();
+    const restrictedFiles = [];
+    for (const id of ids) {
+      const src = tgFiles.find(f => f.id === id);
+      if (src) {
+        const uploadDate = new Date(src.uploadDate);
+        const diffHours = (now - uploadDate) / (1000 * 60 * 60);
+        if (diffHours > 48) {
+          restrictedFiles.push(src.name);
+        }
+      }
+    }
+    if (restrictedFiles.length > 0) {
+      await customAlert(
+        "Cannot Delete Files",
+        `Some selected files (such as "${restrictedFiles[0]}") were uploaded more than 48 hours ago. Bots cannot delete files older than 48 hours on Telegram. Please log in with a User account.`,
+        "Got it",
+        "warning"
+      );
+      return;
+    }
+  }
   
   const ok = await customConfirm(
     "Delete from Telegram",
@@ -1965,6 +2247,7 @@ window.logout = logout;
 window.switchView = switchView;
 window.handleUpload = handleUpload;
 window.downloadFile = downloadFile;
+window.downloadFolder = downloadFolder;
 window.previewFile = previewFile;
 window.loadPreview = loadPreview;
 window.previewNav = previewNav;
