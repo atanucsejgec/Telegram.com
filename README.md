@@ -19,7 +19,7 @@ A Google Drive–style cloud storage app that uses **Telegram as its storage bac
 - ✈️ **Telegram Files view** — a flat view of *everything* in the storage chat, including files you sent directly from the Telegram app ("Unlisted"), with one-click **Import** into your drive.
 - 🔐 **Two login modes:**
   - **User account** — phone number + login code (2FA supported). Files stored in Saved Messages.
-  - **Bot** — bot token + private channel ID. Files stored in the channel.
+  - **Bot** — bot token + private channel ID. Files stored in the channel (note: Telegram restricts Bots from deleting files older than 48 hours; the app checks this and alerts you).
 
 ## Getting started
 
@@ -77,3 +77,4 @@ Then in your repo: **Settings → Pages → Source: `gh-pages` branch, `/ (root)
 - Max **2 GB per file** (Telegram limit; 4 GB with Telegram Premium user accounts).
 - Files are buffered in browser memory during upload/download, so very large files are limited by your device's RAM.
 - Bots cannot read channel history — the app works around this by pinning the database message and scanning message IDs, so the first "Telegram Files" scan with a bot may be slower.
+- **Bot Deletion 48-Hour Limit:** Telegram restricts bot accounts from deleting messages/files uploaded more than 48 hours ago. The app handles this gracefully by checking file age and displaying a warning to log in via a User Phone session to delete older files.
