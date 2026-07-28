@@ -817,6 +817,8 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
 @keyframes upload-icon-bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-2px)}}
 .upload-panel-header button{color:var(--text-2);cursor:pointer;padding:6px;border-radius:6px;transition:var(--t)}
 .upload-panel-header button:hover{color:var(--text-1);background:rgba(163,178,217,.08)}
+.upload-panel.minimized .upload-list{display:none}
+.upload-panel.minimized .upload-panel-header{border-bottom:none}
 .upload-list{max-height:280px;overflow-y:auto}
 .upload-item{display:flex;align-items:center;gap:12px;padding:12px 20px;border-bottom:1px solid var(--border);animation:rise-in .35s var(--ease-out)}
 .upload-item:last-child{border:none}

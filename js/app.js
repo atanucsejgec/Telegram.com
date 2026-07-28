@@ -480,11 +480,22 @@ function showApp() {
   show("app-screen");
   hide("help-trigger-btn");
   el("help-drawer").classList.remove("open");
+  // Hide messenger screen on app load
+  const messengerScreen = el("messenger-screen");
+  if (messengerScreen) messengerScreen.classList.remove("active");
+  // Show Chats & Channels nav only for user sessions (not bot)
+  const navMessenger = el("nav-messenger");
+  if (navMessenger) {
+    const isBot = localStorage.getItem("tgDriveSessionType") === "bot";
+    navMessenger.style.display = isBot ? "none" : "";
+  }
   if (currentUser) {
     el("user-name").textContent = currentUser.name;
     el("user-phone").textContent = currentUser.phone;
     el("user-avatar").textContent = currentUser.name[0].toUpperCase();
   }
+  // Expose client for messenger module
+  window.tgClient = client;
 }
 
 async function sendCode() {
@@ -778,7 +789,7 @@ async function loadFiles(folderId) {
 
 function renderBreadcrumb(bc) {
   if (!bc) bc = [{ id: "root", name: "My Drive" }];
-  const viewNames = { files: "My Drive", recent: "Recent", starred: "Starred", images: "Images", videos: "Videos", audio: "Audio", documents: "Documents", telegram: "Telegram Files", trash: "Trash" };
+  const viewNames = { files: "My Drive", recent: "Recent", starred: "Starred", images: "Images", videos: "Videos", audio: "Audio", documents: "Documents", telegram: "Telegram Files", messenger: "Chats & Channels", trash: "Trash" };
   if (currentView !== "files") {
     el("breadcrumb").innerHTML = `<a href="#" onclick="window.switchView('${currentView}')">${viewNames[currentView] || currentView}</a>`;
     return;
@@ -875,7 +886,13 @@ const MAX_PARALLEL_UPLOADS = 4;
 async function uploadEntries(entries) {
   if (!entries?.length) return;
   const list = el("upload-list");
-  show("upload-panel");
+  const panel = el("upload-panel");
+  if (panel) {
+    show("upload-panel");
+    panel.classList.remove("minimized");
+    const icon = panel.querySelector(".upload-panel-header button i");
+    if (icon) icon.className = "fas fa-chevron-down";
+  }
   list.innerHTML = "";
   const baseFolderId = currentFolder;
 
@@ -960,11 +977,318 @@ async function uploadSingleEntry(item, baseFolderId) {
   }
 }
 
-// ==================== DOWNLOAD ====================
+// ── FAST CONCURRENT DOWNLOADER QUEUE ──
+window._downloadQueue = window._downloadQueue || [];
+window._isDownloading = window._isDownloading || false;
+window._downloadTasks = new Map();
+
+class DownloadTask {
+  constructor(client, Api, msg, writable, fileName, resolve, reject, item) {
+    this.client = client;
+    this.Api = Api;
+    this.msg = msg;
+    this.writable = writable;
+    this.fileName = fileName;
+    this.resolve = resolve;
+    this.reject = reject;
+    this.item = item;
+    
+    this.isPaused = false;
+    this.isCancelled = false;
+    
+    this.CHUNK_SIZE = 1048576; // 1MB
+    this.fileSize = Number(msg.media?.document?.size || 0);
+    this.numChunks = Math.ceil(this.fileSize / this.CHUNK_SIZE);
+    this.currentChunk = 0;
+    this.downloadedBytes = 0;
+    this.hasError = false;
+    this.lastError = null;
+    
+    this.startTime = Date.now();
+    this.activeWorkers = 0;
+    
+    this.progressBar = item.querySelector(".upload-progress-bar");
+    this.statusLabel = item.querySelector(".upload-status");
+    
+    if (this.fileSize > 0) {
+      this.location = new this.Api.InputDocumentFileLocation({
+        id: msg.media.document.id,
+        accessHash: msg.media.document.accessHash,
+        fileReference: msg.media.document.fileReference,
+        thumbSize: ""
+      });
+    }
+  }
+
+  updateProgress() {
+    if (!this.progressBar || !this.statusLabel) return;
+    const pct = Math.max(0, Math.min(100, Math.round((this.downloadedBytes / this.fileSize) * 100)));
+    
+    let etaStr = "";
+    if (!this.isPaused) {
+      const elapsedMs = Date.now() - this.startTime;
+      if (elapsedMs > 1000 && this.downloadedBytes > 0) {
+        const bytesPerSec = this.downloadedBytes / (elapsedMs / 1000);
+        const remainingBytes = this.fileSize - this.downloadedBytes;
+        const remainingSecs = Math.round(remainingBytes / bytesPerSec);
+        
+        if (remainingSecs >= 60) {
+          const mins = Math.floor(remainingSecs / 60);
+          const secs = remainingSecs % 60;
+          etaStr = ` (${mins}m ${secs}s left)`;
+        } else {
+          etaStr = ` (${remainingSecs}s left)`;
+        }
+      }
+    }
+
+    this.progressBar.style.width = pct + "%";
+    this.statusLabel.textContent = this.isPaused ? `Paused... ${pct}%` : `Downloading... ${pct}%${etaStr}`;
+  }
+
+  finalizeUI(error) {
+    if (this.isCancelled) {
+      if(this.statusLabel) {
+        this.statusLabel.textContent = "✗ Cancelled";
+        this.statusLabel.className = "upload-status error";
+      }
+      if(this.progressBar) this.progressBar.style.background = "var(--danger)";
+    } else if (error) {
+      if(this.statusLabel) {
+        this.statusLabel.textContent = "✗ " + (error.message || "Failed");
+        this.statusLabel.className = "upload-status error";
+      }
+      if(this.progressBar) this.progressBar.style.background = "var(--danger)";
+    } else {
+      if(this.statusLabel) {
+        this.statusLabel.textContent = "✓ Complete";
+        this.statusLabel.className = "upload-status success";
+      }
+      if(this.progressBar) {
+        this.progressBar.style.width = "100%";
+        this.progressBar.style.background = "var(--success)";
+      }
+    }
+    
+    const playPauseBtn = this.item.querySelector('.upload-item-pause');
+    if(playPauseBtn) playPauseBtn.remove();
+  }
+
+  async start() {
+    if (this.fileSize === 0) {
+      try {
+        const iter = this.client.iterDownload({ file: this.msg.media, requestSize: this.CHUNK_SIZE });
+        for await (const chunk of iter) {
+          if (this.isCancelled) break;
+          await this.writable.write(chunk);
+        }
+        if (this.isCancelled) throw new Error("Cancelled");
+        this.finalizeUI(null);
+        this.resolve();
+      } catch (e) {
+        this.finalizeUI(e);
+        this.reject(e);
+      }
+      return;
+    }
+
+    this.statusLabel.textContent = "Downloading... 0%";
+    this.startTime = Date.now();
+    this.spawnWorkers();
+  }
+
+  async spawnWorkers() {
+    if (this.isPaused || this.isCancelled || this.currentChunk >= this.numChunks) return;
+    
+    const WORKERS = 4;
+    const promises = [];
+    
+    for (let i = 0; i < WORKERS; i++) {
+      promises.push((async () => {
+        this.activeWorkers++;
+        while (this.currentChunk < this.numChunks && !this.hasError && !this.isPaused && !this.isCancelled) {
+          const chunkIdx = this.currentChunk++;
+          const offset = chunkIdx * this.CHUNK_SIZE;
+
+          try {
+            const result = await this.client.invoke(new this.Api.upload.GetFile({
+              location: this.location,
+              offset: offset,
+              limit: this.CHUNK_SIZE
+            }));
+            
+            if (result && result.bytes && !this.hasError && !this.isCancelled) {
+              await this.writable.write({ type: "write", position: offset, data: result.bytes });
+              this.downloadedBytes += result.bytes.length;
+              this.updateProgress();
+            }
+          } catch (e) {
+            this.hasError = true;
+            this.lastError = e;
+          }
+        }
+        this.activeWorkers--;
+      })());
+    }
+
+    await Promise.all(promises);
+    
+    if (this.activeWorkers === 0) {
+      if (this.isCancelled) {
+        this.finalizeUI();
+        this.reject(new Error("Cancelled"));
+      } else if (this.hasError) {
+        this.finalizeUI(this.lastError);
+        this.reject(this.lastError);
+      } else if (!this.isPaused && this.currentChunk >= this.numChunks) {
+        this.finalizeUI(null);
+        this.resolve();
+      }
+    }
+  }
+
+  pause() {
+    if (this.currentChunk >= this.numChunks || this.isCancelled || this.hasError) return;
+    this.isPaused = true;
+    this.updateProgress();
+    const icon = this.item.querySelector('.upload-item-pause i');
+    if(icon) icon.className = "fas fa-play";
+  }
+
+  resume() {
+    if (this.currentChunk >= this.numChunks || this.isCancelled || this.hasError) return;
+    this.isPaused = false;
+    this.startTime = Date.now();
+    this.updateProgress();
+    const icon = this.item.querySelector('.upload-item-pause i');
+    if(icon) icon.className = "fas fa-pause";
+    this.spawnWorkers();
+  }
+
+  async cancel() {
+    if (this.isCancelled) return;
+    this.isCancelled = true;
+    this.isPaused = false;
+    try { await this.writable.abort(); } catch(e) { console.error("Abort error:", e); }
+    
+    if (this.activeWorkers === 0) {
+      this.finalizeUI();
+      this.reject(new Error("Cancelled"));
+    }
+  }
+}
+
+window.fastStreamDownload = function(client, Api, msg, writable, fileName) {
+  return new Promise((resolve, reject) => {
+    const panel = el("upload-panel");
+    const list = el("upload-list");
+    if (panel) {
+      const headerTitle = panel.querySelector("h4");
+      if (headerTitle) headerTitle.innerHTML = `<i class="fas fa-exchange-alt"></i> Transfers`;
+      show("upload-panel");
+      panel.classList.remove("minimized");
+      const icon = panel.querySelector(".upload-panel-header button i");
+      if (icon) icon.className = "fas fa-chevron-down";
+    }
+
+    const taskId = "task_" + Date.now() + "_" + Math.floor(Math.random()*1000);
+    const item = document.createElement("div");
+    item.className = "upload-item";
+    item.innerHTML = `<div class="upload-item-icon"><i class="${fileIcon(fileTypeFromMime("application/octet-stream", fileName))}"></i></div>
+    <div class="upload-item-info">
+      <div class="upload-item-name">${esc(fileName)}</div>
+      <div class="upload-progress"><div class="upload-progress-bar" style="width:0%"></div></div>
+      <div class="upload-status">Queued...</div>
+    </div>
+    <button class="upload-item-pause" onclick="window.toggleDownloadPause('${taskId}')" style="background:none; border:none; color:var(--text-3); cursor:pointer; padding:4px; margin-left:auto;"><i class="fas fa-pause"></i></button>
+    <button class="upload-item-dismiss" onclick="window.cancelDownload('${taskId}', this.parentElement)" style="background:none; border:none; color:var(--text-3); cursor:pointer; padding:4px;"><i class="fas fa-times"></i></button>`;
+    if (list) list.appendChild(item);
+
+    const task = new DownloadTask(client, Api, msg, writable, fileName, resolve, reject, item);
+    window._downloadTasks.set(taskId, task);
+
+    window._downloadQueue.push(task);
+    window._processDownloadQueue();
+  });
+};
+
+window.toggleDownloadPause = function(taskId) {
+  const task = window._downloadTasks.get(taskId);
+  if (!task) return;
+  if (task.isPaused) task.resume();
+  else task.pause();
+};
+
+window.cancelDownload = function(taskId, itemElem) {
+  const task = window._downloadTasks.get(taskId);
+  if (task) task.cancel();
+  if (itemElem) itemElem.remove();
+  if(!document.getElementById('upload-list').children.length) document.getElementById('upload-panel').classList.add('hidden');
+};
+
+window._processDownloadQueue = async function() {
+  if (window._isDownloading || window._downloadQueue.length === 0) return;
+  window._isDownloading = true;
+  
+  const task = window._downloadQueue.shift();
+  
+  try {
+    if (!task.isCancelled) {
+      await new Promise((res, rej) => {
+         const origResolve = task.resolve;
+         const origReject = task.reject;
+         
+         task.resolve = (...args) => { res(); origResolve(...args); };
+         task.reject = (...args) => { res(); origReject(...args); };
+         
+         task.start();
+      });
+    }
+  } catch (e) {
+    // handled inside DownloadTask
+  } finally {
+    window._isDownloading = false;
+    window._processDownloadQueue();
+  }
+};
+
 async function downloadFile(id, name) {
   const file = fileDatabase.files.find(f => f.id === id) || allFiles.find(f => f.id === id);
   const finalName = name || file?.name || "download";
-  toast(`Downloading "${finalName}"...`, "info");
+  
+  // 1. Direct-to-Disk Streaming (Modern Browsers)
+  if (window.showSaveFilePicker) {
+    try {
+      const handle = await window.showSaveFilePicker({ suggestedName: finalName });
+      const writable = await handle.createWritable();
+      
+      toast(`Downloading "${finalName}"... (Streaming direct to disk)`, "info");
+      
+      const messages = await client.getMessages(targetPeer, { ids: [file.messageId] });
+      if (!messages?.[0] || !messages[0].media) throw new Error("File not found on Telegram");
+      
+      // True concurrent download using our custom downloader
+      await window.fastStreamDownload(client, Api, messages[0], writable, finalName);
+      
+      await writable.close();
+      
+      toast(`"${finalName}" downloaded successfully`, "success");
+      return;
+    } catch (e) {
+      if (e.name === 'AbortError') return; // User cancelled the save dialog
+      console.error("Stream download failed:", e);
+      toast("Stream download failed, falling back to memory...", "warning");
+      // Fall through to memory fallback if streaming fails for unexpected reasons
+    }
+  } else {
+    // Show warning for large files if streaming is unsupported
+    if (file?.size > 500 * 1024 * 1024) {
+      toast("Warning: Browser doesn't support streaming. Tab may freeze during download.", "warning");
+    }
+  }
+
+  // 2. Fallback: Download to Memory (Firefox, Mobile, or if stream fails)
+  toast(`Downloading "${finalName}" to memory...`, "info");
   try {
     const url = await getFileObjectUrl(id, false);
     if (!url) throw new Error("Could not download file");
@@ -1719,7 +2043,23 @@ function handleSort(val) {
 }
 
 function switchView(view) {
+  // Close messenger if switching away from it
+  if (currentView === "messenger" && view !== "messenger" && window.closeMessenger) {
+    window.closeMessenger();
+  }
   currentView = view; updateNav(view);
+  if (view === "messenger") {
+    // Hide drive-specific top bar elements
+    if (el("sort-select")) el("sort-select").style.display = "none";
+    if (el("view-toggle")) el("view-toggle").style.display = "none";
+    if (el("topbar-new-folder")) el("topbar-new-folder").style.display = "none";
+    el("breadcrumb").innerHTML = `<a href="#" onclick="window.switchView('messenger')">Chats & Channels</a>`;
+    if (window.openMessenger) window.openMessenger();
+    return;
+  }
+  // Restore drive top bar elements when switching back
+  if (el("sort-select")) el("sort-select").style.display = "";
+  if (el("view-toggle")) el("view-toggle").style.display = "";
   if (view === "files") { currentFolder = "root"; loadFiles(); }
   else if (view === "recent" || view === "starred" || view === "trash") loadFiles();
   else if (view === "telegram") loadTelegramView(true);
@@ -2175,7 +2515,15 @@ function hide(id) { el(id)?.classList.add("hidden"); }
 function toggle(id, show) { show ? el(id)?.classList.remove("hidden") : el(id)?.classList.add("hidden"); }
 function closeModal(id) { hide(id); }
 function toggleSidebar() { el("sidebar").classList.toggle("open"); }
-function toggleUploadPanel() { el("upload-panel").classList.toggle("hidden"); }
+function toggleUploadPanel() { 
+  const panel = el("upload-panel");
+  if (!panel) return;
+  panel.classList.toggle("minimized");
+  const icon = panel.querySelector(".upload-panel-header button i");
+  if (icon) {
+    icon.className = panel.classList.contains("minimized") ? "fas fa-chevron-up" : "fas fa-chevron-down";
+  }
+}
 function esc(s) { if (!s) return ""; const d = document.createElement("div"); d.textContent = s; return d.innerHTML.replace(/"/g, "&quot;").replace(/'/g, "&#39;"); }
 function escCode(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 
@@ -2336,3 +2684,8 @@ window.setGuide = setGuide;
 window.moveGuide = moveGuide;
 window.toggleHelpDrawer = toggleHelpDrawer;
 window.toggleUploadPanel = toggleUploadPanel;
+
+window.tgClient = null;  // will be set after login in showApp()
+window.tgApi = Api;      // export Api for messenger.js concurrent downloader
+window._msgToast = toast;
+window._msgEsc = esc;
