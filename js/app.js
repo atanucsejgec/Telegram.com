@@ -2685,6 +2685,13 @@ window.moveGuide = moveGuide;
 window.toggleHelpDrawer = toggleHelpDrawer;
 window.toggleUploadPanel = toggleUploadPanel;
 
+window.setLoginMethod = setLoginMethod;
+window.sendCode = sendCode;
+window.verifyCode = verifyCode;
+window.loginAsBot = loginAsBot;
+window.backToPhone = backToPhone;
+window.logout = logout;
+
 window.tgClient = null;  // will be set after login in showApp()
 window.tgApi = Api;      // export Api for messenger.js concurrent downloader
 window._msgToast = toast;
