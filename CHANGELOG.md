@@ -2,7 +2,26 @@
 
 All notable changes to the Telegram Drive Serverless project will be documented in this file.
 
-## [2026-07-29]
+## [2026-07-29 12:51 PM IST]
+
+### Added
+- **Service Worker Streaming Download for Mobile Browsers**: Introduced a new download tier streaming file chunks directly to the browser's native download manager via a Service Worker, bypassing the RAM bottleneck on mobile devices.
+  - **`public/sw-download.js`**: Lightweight Service Worker intercepting `/sw-download/{uuid}` fetch requests and responding with a streaming `Response` backed by a `ReadableStream` fed from a `MessagePort`.
+  - **`SwWritableAdapter`**: Wraps a `MessagePort` to mimic a `WritableFileStream` interface (`write`, `close`, `abort`), enabling `DownloadTask` to stream through the Service Worker smoothly.
+  - **Reorder Buffer in `DownloadTask`**: Added `sequential` mode with `reorderBuf` (Map) to buffer out-of-order chunks from 4 concurrent workers and flush them sequentially.
+  - **`window.swStreamDownload()`**: Manages the `MessageChannel`, iframe trigger, and sequential `DownloadTask`.
+  - *Supported browsers:* Chrome Android 90+, Safari iOS 15+, Firefox Android.
+
+### Changed
+- **3-Tier Download Fallback Chain**: Updated `downloadFile()` and `performDownloadMedia()` to use:
+  1. `showSaveFilePicker` (Desktop - zero RAM, random-access)
+  2. Service Worker stream (Mobile - low RAM, sequential stream)
+  3. Blob in RAM (Legacy browsers)
+- **Auth Handler Global Exports**: Exported `sendCode`, `verifyCode`, `loginAsBot`, `setLoginMethod`, `backToPhone`, and `logout` to `window` for mobile/web login compatibility.
+
+---
+
+## [2026-07-29 05:09 AM IST]
 
 ### Added
 - **Chats & Channels (Messenger Module)**:
