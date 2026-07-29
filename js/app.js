@@ -42,6 +42,10 @@ let previewableFiles = [];
 const objectUrlCache = new Map();
 const fetchingPromises = new Map();
 
+// ==================== SPA HISTORY & BACK BUTTON MANAGEMENT ====================
+let isHandlingPopState = false;
+window.isHandlingPopState = false;
+
 // ==================== INIT ====================
 document.addEventListener("DOMContentLoaded", () => {
   addLoadingParticles();
@@ -552,6 +556,11 @@ function showApp() {
   }
   // Expose client for messenger module
   window.tgClient = client;
+
+  // Initialize initial history state if not set
+  if (!history.state) {
+    history.replaceState({ view: currentView, folder: currentFolder }, "");
+  }
 }
 
 async function sendCode() {
@@ -1598,12 +1607,15 @@ async function downloadFolder(id) {
 }
 
 // ==================== PREVIEW ====================
-async function previewFile(id) {
+async function previewFile(id, pushHistory = true) {
   previewableFiles = currentFiles;
   previewIndex = previewableFiles.findIndex(f => f.id === id);
   if (previewIndex === -1) return;
   previewFileId = id;
   show("preview-modal");
+  if (pushHistory && !isHandlingPopState) {
+    history.pushState({ view: currentView, folder: currentFolder, previewId: id }, "");
+  }
   await loadPreview(previewableFiles[previewIndex]);
 }
 
@@ -1989,13 +2001,14 @@ async function copyFile(id) {
   hideContext();
 }
 
-async function showInfo(id) {
-  const file = fileDatabase.files.find(f => f.id === id);
+// ==================== INFO ====================
+function showInfo(id) {
+  const file = currentFiles.find(f => f.id === id);
   if (file) {
     const folder = fileDatabase.folders.find(fo => fo.id === file.folderId);
-    el("info-content").innerHTML = `
-      <div style="display:grid;grid-template-columns:110px 1fr;gap:10px;font-size:13px">
-        <span style="color:var(--text-2);font-weight:500">Name</span><span style="font-weight:600">${esc(file.name)}</span>
+    el("info-modal-title").textContent = file.name;
+    el("info-grid").innerHTML = `
+      <div style="display:grid;grid-template-columns:100px 1fr;gap:8px;font-size:13px">
         <span style="color:var(--text-2);font-weight:500">Size</span><span>${fmtBytes(file.size)}</span>
         <span style="color:var(--text-2);font-weight:500">Type</span><span>${file.mimeType || file.type}</span>
         <span style="color:var(--text-2);font-weight:500">Uploaded</span><span>${new Date(file.uploadDate).toLocaleString()}</span>
@@ -2003,6 +2016,9 @@ async function showInfo(id) {
         <span style="color:var(--text-2);font-weight:500">Starred</span><span>${file.starred ? "⭐ Yes" : "No"}</span>
       </div>`;
     show("info-modal");
+    if (!isHandlingPopState) {
+      history.pushState({ view: currentView, folder: currentFolder, modalId: "info-modal" }, "");
+    }
   }
   hideContext();
 }
@@ -2010,6 +2026,9 @@ async function showInfo(id) {
 // ==================== FOLDERS ====================
 function showNewFolder() {
   closeModal("folder-modal"); show("folder-modal");
+  if (!isHandlingPopState) {
+    history.pushState({ view: currentView, folder: currentFolder, modalId: "folder-modal" }, "");
+  }
   el("folder-name").value = ""; el("folder-name").focus();
   el("folder-color-picker").innerHTML = FOLDER_COLORS.map(c =>
     `<div class="color-dot${c === selectedFolderColor ? ' active' : ''}" style="background:${c}" onclick="window.selectFolderColor('${c}',this)"></div>`
@@ -2044,7 +2063,15 @@ async function createFolder() {
   loadFiles();
 }
 
-function navFolder(id) { currentView = "files"; updateNav("files"); currentFolder = id; loadFiles(id); }
+function navFolder(id, pushHistory = true) {
+  currentView = "files";
+  updateNav("files");
+  currentFolder = id;
+  if (pushHistory && !isHandlingPopState) {
+    history.pushState({ view: "files", folder: id }, "");
+  }
+  loadFiles(id);
+}
 
 function getAllSubFolderIds(parentId) {
   const ids = [parentId];
@@ -2116,6 +2143,9 @@ function showRename(type, id) {
   input.value = currentName;
   input.placeholder = type === "folder" ? "New folder name" : "New file name";
   show("rename-modal");
+  if (!isHandlingPopState) {
+    history.pushState({ view: currentView, folder: currentFolder, modalId: "rename-modal" }, "");
+  }
 
   setTimeout(() => {
     input.focus();
@@ -2161,6 +2191,9 @@ async function showMoveModal(ids, type) {
   
   tree.innerHTML = `<div class="tree-item${moveTargetId === 'root' ? ' active' : ''}" onclick="window.selectMoveTarget('root',this)"><i class="fas fa-hard-drive" style="color:var(--primary)"></i>My Drive</div>${renderTree(fileDatabase.folders, "root")}`;
   show("move-modal");
+  if (!isHandlingPopState) {
+    history.pushState({ view: currentView, folder: currentFolder, modalId: "move-modal" }, "");
+  }
 }
 
 function selectMoveTarget(id, elem) {
@@ -2215,12 +2248,15 @@ function handleSort(val) {
   loadFiles();
 }
 
-function switchView(view) {
+function switchView(view, pushHistory = true) {
   // Close messenger if switching away from it
   if (currentView === "messenger" && view !== "messenger" && window.closeMessenger) {
     window.closeMessenger();
   }
   currentView = view; updateNav(view);
+  if (pushHistory && !isHandlingPopState) {
+    history.pushState({ view: view, folder: view === "files" ? currentFolder : "root" }, "");
+  }
   if (view === "messenger") {
     // Hide drive-specific top bar elements
     if (el("sort-select")) el("sort-select").style.display = "none";
@@ -2233,7 +2269,7 @@ function switchView(view) {
   // Restore drive top bar elements when switching back
   if (el("sort-select")) el("sort-select").style.display = "";
   if (el("view-toggle")) el("view-toggle").style.display = "";
-  if (view === "files") { currentFolder = "root"; loadFiles(); }
+  if (view === "files") { currentFolder = currentFolder || "root"; loadFiles(); }
   else if (view === "recent" || view === "starred" || view === "trash") loadFiles();
   else if (view === "telegram") loadTelegramView(true);
   else loadFilteredView(view);
@@ -2852,6 +2888,62 @@ function toggleHelpDrawer() {
   drawer.classList.toggle("open");
   document.body.classList.toggle("drawer-open", drawer.classList.contains("open"));
 }
+
+// ==================== GLOBAL POPSTATE LISTENER ====================
+window.addEventListener("popstate", (e) => {
+  isHandlingPopState = true;
+  window.isHandlingPopState = true;
+
+  // 1. Close file preview if open
+  if (previewFileId) {
+    closePreview();
+    isHandlingPopState = false;
+    window.isHandlingPopState = false;
+    return;
+  }
+
+  // 2. Close any active modal dialog
+  const openModal = document.querySelector(".modal:not(.hidden)");
+  if (openModal) {
+    openModal.classList.add("hidden");
+    isHandlingPopState = false;
+    window.isHandlingPopState = false;
+    return;
+  }
+
+  // 3. Close mobile messenger chat panel if active
+  const messengerScreen = el("messenger-screen");
+  if (messengerScreen && messengerScreen.classList.contains("chat-open")) {
+    if (window.chatBack) window.chatBack();
+    isHandlingPopState = false;
+    window.isHandlingPopState = false;
+    return;
+  }
+
+  // 4. Restore SPA navigation view & folder state
+  if (e.state) {
+    const targetView = e.state.view || "files";
+    const targetFolder = e.state.folder || "root";
+
+    if (targetFolder !== currentFolder) {
+      currentFolder = targetFolder;
+    }
+    if (targetView !== currentView) {
+      switchView(targetView, false);
+    } else if (targetView === "files") {
+      loadFiles();
+    }
+  } else {
+    if (currentFolder !== "root") {
+      navFolder("root", false);
+    } else if (currentView !== "files") {
+      switchView("files", false);
+    }
+  }
+
+  isHandlingPopState = false;
+  window.isHandlingPopState = false;
+});
 
 window.setGuide = setGuide;
 window.moveGuide = moveGuide;

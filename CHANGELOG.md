@@ -2,6 +2,17 @@
 
 All notable changes to the Telegram Drive Serverless project will be documented in this file.
 
+## [2026-07-29 01:17 PM IST]
+
+### Added
+- **SPA Back Button & Mobile Gesture Navigation**: Integrated HTML5 History API (`pushState` / `popstate`) so pressing the browser back button or mobile swipe-back gesture navigates to the previous app state instead of closing or reloading the website.
+  - **Folder & View Stack**: Navigating folders (`navFolder`) or sidebar views (`switchView`) pushes history states, allowing back button to pop back level-by-level.
+  - **File Preview Overlay**: Pressing back while an image/video/pdf/code preview modal is open safely closes the preview overlay while staying on the current folder list.
+  - **Modal Dialogs**: Pressing back closes any active modal (Rename, Move, New Folder, Info, Shortcuts) without triggering page reload.
+  - **Mobile Messenger Panel**: In Messenger view on mobile devices, pressing back while inside a chat screen returns to the chat dialogs list.
+
+---
+
 ## [2026-07-29 12:51 PM IST]
 
 ### Added

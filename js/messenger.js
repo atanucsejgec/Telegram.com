@@ -323,7 +323,12 @@ async function selectDialog(idx) {
 
   // Show chat on mobile
   const screen = el("messenger-screen");
-  if (screen) screen.classList.add("chat-open");
+  if (screen) {
+    screen.classList.add("chat-open");
+    if (window.innerWidth <= 768 && !window.isHandlingPopState) {
+      history.pushState({ view: "messenger", chatOpen: true, dialogId: dlg._id }, "");
+    }
+  }
 
   renderDialogs(); // update active highlight
   renderChatHeader();
@@ -1259,6 +1264,7 @@ window.msgLoadMoreMessages = loadMoreMessages;
 window.msgSendMessage = sendMessage;
 window.msgDownloadMedia = downloadMedia;
 window.msgChatBack = chatBack;
+window.chatBack = chatBack;
 window.msgHandleDialogSearch = handleDialogSearch;
 window.msgClearSearch = clearSearch;
 window.msgSearchDownload = searchDownload;
