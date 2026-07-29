@@ -50,10 +50,66 @@ document.addEventListener("DOMContentLoaded", () => {
   setupDragDrop();
   setupKeys();
   setupRipples();
+  registerDownloadSW();
   document.addEventListener("click", e => {
     if (!document.getElementById("context-menu").contains(e.target)) hideContext();
   });
 });
+
+// ==================== SERVICE WORKER FOR MOBILE DOWNLOADS ====================
+let swReady = false;
+function registerDownloadSW() {
+  if (!('serviceWorker' in navigator)) return;
+  navigator.serviceWorker.register('./sw-download.js', { scope: './' })
+    .then(reg => {
+      console.log('Download SW registered, scope:', reg.scope);
+      // Wait for the SW to be active
+      const sw = reg.active || reg.installing || reg.waiting;
+      if (sw && sw.state === 'activated') { swReady = true; return; }
+      if (sw) {
+        sw.addEventListener('statechange', () => {
+          if (sw.state === 'activated') swReady = true;
+        });
+      }
+      // Also mark ready if controller already exists (page reload)
+      if (navigator.serviceWorker.controller) swReady = true;
+    })
+    .catch(err => console.warn('Download SW registration failed:', err));
+}
+
+/** Adapter that wraps a MessagePort to look like a WritableFileStream for DownloadTask */
+class SwWritableAdapter {
+  constructor(port) {
+    this.port = port;
+    this.closed = false;
+  }
+  /** Sequential write — data is a Uint8Array or ArrayBuffer */
+  async write(data) {
+    if (this.closed) return;
+    // Accept both { data: ... } object form and raw buffer
+    let bytes = data;
+    if (data && data.data) bytes = data.data;
+    // Transfer the buffer for zero-copy perf
+    if (bytes instanceof Uint8Array) {
+      const copy = bytes.slice(); // must copy before transfer
+      this.port.postMessage(copy.buffer, [copy.buffer]);
+    } else if (bytes instanceof ArrayBuffer) {
+      this.port.postMessage(bytes, [bytes]);
+    } else {
+      this.port.postMessage(bytes);
+    }
+  }
+  async close() {
+    if (this.closed) return;
+    this.closed = true;
+    this.port.postMessage({ done: true });
+  }
+  async abort() {
+    if (this.closed) return;
+    this.closed = true;
+    this.port.postMessage({ error: 'cancelled' });
+  }
+}
 
 // ==================== API CREDENTIALS HELPERS ====================
 function getApiCredentials() {
@@ -983,7 +1039,7 @@ window._isDownloading = window._isDownloading || false;
 window._downloadTasks = new Map();
 
 class DownloadTask {
-  constructor(client, Api, msg, writable, fileName, resolve, reject, item) {
+  constructor(client, Api, msg, writable, fileName, resolve, reject, item, sequential = false) {
     this.client = client;
     this.Api = Api;
     this.msg = msg;
@@ -1009,6 +1065,11 @@ class DownloadTask {
     
     this.progressBar = item.querySelector(".upload-progress-bar");
     this.statusLabel = item.querySelector(".upload-status");
+    
+    // Sequential mode for Service Worker streams (no random-access writes)
+    this.sequential = sequential;
+    this.nextFlushIdx = 0;      // next chunk index to flush
+    this.reorderBuf = new Map(); // chunkIdx -> Uint8Array
     
     if (this.fileSize > 0) {
       this.location = new this.Api.InputDocumentFileLocation({
@@ -1097,6 +1158,18 @@ class DownloadTask {
     this.spawnWorkers();
   }
 
+  /** Flush any buffered chunks that are now in order (sequential mode only) */
+  async flushReorderBuf() {
+    while (this.reorderBuf.has(this.nextFlushIdx)) {
+      const bytes = this.reorderBuf.get(this.nextFlushIdx);
+      this.reorderBuf.delete(this.nextFlushIdx);
+      this.nextFlushIdx++;
+      await this.writable.write(bytes);
+      this.downloadedBytes += bytes.length;
+      this.updateProgress();
+    }
+  }
+
   async spawnWorkers() {
     if (this.isPaused || this.isCancelled || this.currentChunk >= this.numChunks) return;
     
@@ -1118,9 +1191,16 @@ class DownloadTask {
             }));
             
             if (result && result.bytes && !this.hasError && !this.isCancelled) {
-              await this.writable.write({ type: "write", position: offset, data: result.bytes });
-              this.downloadedBytes += result.bytes.length;
-              this.updateProgress();
+              if (this.sequential) {
+                // Buffer chunk and flush in order
+                this.reorderBuf.set(chunkIdx, result.bytes);
+                await this.flushReorderBuf();
+              } else {
+                // Random-access write (File System Access API)
+                await this.writable.write({ type: "write", position: offset, data: result.bytes });
+                this.downloadedBytes += result.bytes.length;
+                this.updateProgress();
+              }
             }
           } catch (e) {
             this.hasError = true;
@@ -1252,11 +1332,88 @@ window._processDownloadQueue = async function() {
   }
 };
 
+/**
+ * Service Worker streaming download.
+ * Creates a MessageChannel, sends one port to the SW, wraps the other in SwWritableAdapter,
+ * and creates a DownloadTask in sequential mode. Navigates a hidden iframe to trigger the
+ * browser's native download manager.
+ */
+window.swStreamDownload = async function(client, Api, msg, fileName, mime, size) {
+  const uuid = crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).substr(2));
+  const mc = new MessageChannel();
+  const swPort = mc.port1;  // goes to Service Worker
+  const appPort = mc.port2; // stays in main thread
+
+  // Send port to Service Worker
+  navigator.serviceWorker.controller.postMessage({
+    type: "INIT_PORT",
+    uuid,
+    filename: fileName,
+    mime: mime || "application/octet-stream",
+    size: Number(size) || Number(msg.media?.document?.size || 0)
+  }, [swPort]);
+
+  // Navigate iframe FIRST to create the fetch intercepted by the SW.
+  // The SW will create a ReadableStream bound to the MessagePort.
+  // Then the DownloadTask streams chunks through the port.
+  const iframe = document.createElement("iframe");
+  iframe.hidden = true;
+  iframe.src = `./sw-download/${uuid}`;
+  document.body.appendChild(iframe);
+  setTimeout(() => iframe.remove(), 300000); // cleanup after 5 min
+
+  // Small delay to let the SW fetch handler set up the ReadableStream
+  await new Promise(r => setTimeout(r, 100));
+
+  // Wrap our port as a writable
+  const writable = new SwWritableAdapter(appPort);
+
+  // Show transfer panel
+  const panel = el("upload-panel");
+  const list = el("upload-list");
+  if (panel) {
+    const headerTitle = panel.querySelector("h4");
+    if (headerTitle) headerTitle.innerHTML = `<i class="fas fa-exchange-alt"></i> Transfers`;
+    show("upload-panel");
+    panel.classList.remove("minimized");
+    const icon = panel.querySelector(".upload-panel-header button i");
+    if (icon) icon.className = "fas fa-chevron-down";
+  }
+
+  const taskId = "task_" + Date.now() + "_" + Math.floor(Math.random()*1000);
+  const item = document.createElement("div");
+  item.className = "upload-item";
+  item.innerHTML = `<div class="upload-item-icon"><i class="${fileIcon(fileTypeFromMime("application/octet-stream", fileName))}"></i></div>
+  <div class="upload-item-info">
+    <div class="upload-item-name">${esc(fileName)}</div>
+    <div class="upload-progress"><div class="upload-progress-bar" style="width:0%"></div></div>
+    <div class="upload-status">Queued...</div>
+  </div>
+  <button class="upload-item-pause" onclick="window.toggleDownloadPause('${taskId}')" style="background:none; border:none; color:var(--text-3); cursor:pointer; padding:4px; margin-left:auto;"><i class="fas fa-pause"></i></button>
+  <button class="upload-item-dismiss" onclick="window.cancelDownload('${taskId}', this.parentElement)" style="background:none; border:none; color:var(--text-3); cursor:pointer; padding:4px;"><i class="fas fa-times"></i></button>`;
+  if (list) list.appendChild(item);
+
+  // Use sequential mode for SW stream (reorder buffer)
+  return new Promise((resolve, reject) => {
+    const task = new DownloadTask(client, Api, msg, writable, fileName,
+      // resolve: all chunks written — close the SW port to signal stream end
+      () => { writable.close(); resolve(); },
+      // reject: error — abort the SW stream
+      (err) => { writable.abort(); reject(err); },
+      item, true /* sequential */
+    );
+    window._downloadTasks.set(taskId, task);
+
+    window._downloadQueue.push(task);
+    window._processDownloadQueue();
+  });
+};
+
 async function downloadFile(id, name) {
   const file = fileDatabase.files.find(f => f.id === id) || allFiles.find(f => f.id === id);
   const finalName = name || file?.name || "download";
   
-  // 1. Direct-to-Disk Streaming (Modern Browsers)
+  // 1. Direct-to-Disk Streaming (Desktop Chrome/Edge/Opera)
   if (window.showSaveFilePicker) {
     try {
       const handle = await window.showSaveFilePicker({ suggestedName: finalName });
@@ -1267,7 +1424,6 @@ async function downloadFile(id, name) {
       const messages = await client.getMessages(targetPeer, { ids: [file.messageId] });
       if (!messages?.[0] || !messages[0].media) throw new Error("File not found on Telegram");
       
-      // True concurrent download using our custom downloader
       await window.fastStreamDownload(client, Api, messages[0], writable, finalName);
       
       await writable.close();
@@ -1275,19 +1431,34 @@ async function downloadFile(id, name) {
       toast(`"${finalName}" downloaded successfully`, "success");
       return;
     } catch (e) {
-      if (e.name === 'AbortError') return; // User cancelled the save dialog
+      if (e.name === 'AbortError') return;
       console.error("Stream download failed:", e);
-      toast("Stream download failed, falling back to memory...", "warning");
-      // Fall through to memory fallback if streaming fails for unexpected reasons
-    }
-  } else {
-    // Show warning for large files if streaming is unsupported
-    if (file?.size > 500 * 1024 * 1024) {
-      toast("Warning: Browser doesn't support streaming. Tab may freeze during download.", "warning");
+      toast("Stream download failed, trying alternative...", "warning");
     }
   }
 
-  // 2. Fallback: Download to Memory (Firefox, Mobile, or if stream fails)
+  // 2. Service Worker Streaming (Mobile Chrome/Safari/Firefox)
+  if (swReady && navigator.serviceWorker?.controller) {
+    try {
+      toast(`Downloading "${finalName}"... (Streaming via Service Worker)`, "info");
+      
+      const messages = await client.getMessages(targetPeer, { ids: [file.messageId] });
+      if (!messages?.[0] || !messages[0].media) throw new Error("File not found on Telegram");
+      
+      await window.swStreamDownload(client, Api, messages[0], finalName, file?.mimeType, file?.size);
+      
+      toast(`"${finalName}" download started`, "success");
+      return;
+    } catch (e) {
+      console.error("SW stream download failed:", e);
+      toast("Stream download failed, falling back to memory...", "warning");
+    }
+  }
+
+  // 3. Fallback: Download to Memory (legacy browsers)
+  if (file?.size > 500 * 1024 * 1024) {
+    toast("Warning: Large file will be loaded into memory. Tab may freeze.", "warning");
+  }
   toast(`Downloading "${finalName}" to memory...`, "info");
   try {
     const url = await getFileObjectUrl(id, false);

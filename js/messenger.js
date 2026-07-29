@@ -688,7 +688,17 @@ async function downloadMedia(msgId) {
 
 // ── Shared Download Logic for Messenger ──
 async function performDownloadMedia(client, msg, fileName) {
-  // 1. Direct-to-Disk Streaming
+  // Determine mime and size for SW stream
+  let mime = "application/octet-stream";
+  let size = 0;
+  if (msg.media?.document) {
+    mime = msg.media.document.mimeType || mime;
+    size = Number(msg.media.document.size || 0);
+  } else if (msg.media?.photo) {
+    mime = "image/jpeg";
+  }
+
+  // 1. Direct-to-Disk Streaming (Desktop Chrome/Edge/Opera)
   if (window.showSaveFilePicker) {
     try {
       const handle = await window.showSaveFilePicker({ suggestedName: fileName });
@@ -696,7 +706,6 @@ async function performDownloadMedia(client, msg, fileName) {
       
       toast(`Downloading "${fileName}"... (Streaming direct to disk)`, "info");
       
-      // Use the true concurrent downloader from app.js
       await window.fastStreamDownload(client, window.tgApi, msg, writable, fileName);
       
       await writable.close();
@@ -704,22 +713,37 @@ async function performDownloadMedia(client, msg, fileName) {
       toast(`"${fileName}" downloaded successfully`, "success");
       return;
     } catch (e) {
-      if (e.name === 'AbortError') return; // User cancelled
+      if (e.name === 'AbortError') return;
       console.error("Stream download failed:", e);
+      toast("Stream download failed, trying alternative...", "warning");
+    }
+  }
+
+  // 2. Service Worker Streaming (Mobile Chrome/Safari/Firefox)
+  if (window.swStreamDownload && navigator.serviceWorker?.controller) {
+    try {
+      toast(`Downloading "${fileName}"... (Streaming via Service Worker)`, "info");
+      
+      await window.swStreamDownload(client, window.tgApi, msg, fileName, mime, size);
+      
+      toast(`"${fileName}" download started`, "success");
+      return;
+    } catch (e) {
+      console.error("SW stream download failed:", e);
       toast("Stream download failed, falling back to memory...", "warning");
     }
   }
 
-  // 2. Fallback to Memory
+  // 3. Fallback: Download to Memory (legacy browsers)
+  if (size > 500 * 1024 * 1024) {
+    toast("Warning: Large file will be loaded into memory. Tab may freeze.", "warning");
+  }
   toast(`Downloading "${fileName}" to memory...`, "info");
   
   const buffer = await client.downloadMedia(msg, {});
   if (!buffer) throw new Error("Download failed");
 
   const rawUint8 = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-  let mime = "application/octet-stream";
-  if (msg.media?.document?.mimeType) mime = msg.media.document.mimeType;
-  else if (msg.media?.photo) mime = "image/jpeg";
 
   const blob = new Blob([rawUint8], { type: mime });
   const url = URL.createObjectURL(blob);
