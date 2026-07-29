@@ -14,8 +14,8 @@
         rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
     <meta name="theme-color" content="#07090f">
-  <script type="module" crossorigin src="./assets/index-BILv0F0Q.js"></script>
-  <link rel="stylesheet" crossorigin href="./assets/index-DS3yK3yX.css">
+  <script type="module" crossorigin src="./assets/index-D8ySzf1f.js"></script>
+  <link rel="stylesheet" crossorigin href="./assets/index-_ZdnM2hL.css">
 </head>
 
 <body>
@@ -352,6 +352,8 @@
                         class="fas fa-file-alt"></i><span>Documents</span></a>
                 <a href="#" class="nav-item" data-view="telegram" onclick="switchView('telegram')"><i
                         class="fab fa-telegram"></i><span>Telegram Files</span></a>
+                <a href="#" class="nav-item" data-view="messenger" id="nav-messenger" onclick="switchView('messenger')" style="display:none"><i
+                        class="fas fa-comments"></i><span>Chats & Channels</span></a>
                 <a href="#" class="nav-item" data-view="trash" onclick="switchView('trash')"><i
                         class="fas fa-trash"></i><span>Trash</span><span class="badge" id="trash-badge"></span></a>
             </nav>
@@ -457,6 +459,46 @@
                 <div class="trash-bar hidden" id="trash-bar"><i class="fas fa-info-circle"></i><span>Items in trash are
                         deleted forever after 30 days</span><button class="btn btn-danger btn-sm"
                         onclick="emptyTrash()"><i class="fas fa-trash"></i> Empty Trash</button></div>
+            </div>
+
+            <!-- Messenger Screen (Chats & Channels) -->
+            <div id="messenger-screen" class="messenger-screen">
+                <!-- Dialog List (Left Panel) -->
+                <div class="messenger-dialogs">
+                    <div class="dialogs-header">
+                        <h3><i class="fas fa-comments"></i> Chats & Channels</h3>
+                    </div>
+                    <div class="dialogs-search">
+                        <div class="msg-search-wrapper">
+                            <i class="fas fa-search msg-search-icon" id="msg-search-icon"></i>
+                            <input type="text" id="msg-dialog-search" placeholder="Search files, chats, or paste t.me link...">
+                            <button class="msg-search-clear hidden" id="msg-search-clear" onclick="window.msgClearSearch()"><i class="fas fa-times"></i></button>
+                        </div>
+                        <div class="msg-search-hint hidden" id="msg-search-hint"></div>
+                    </div>
+                    <div class="msg-search-results hidden" id="msg-search-results"></div>
+                    <div class="dialogs-list" id="messenger-dialog-list"></div>
+                </div>
+                <!-- Chat View (Right Panel) -->
+                <div class="messenger-chat">
+                    <div class="chat-header">
+                        <button class="chat-back-btn" onclick="window.msgChatBack()"><i class="fas fa-arrow-left"></i></button>
+                        <div class="chat-header-info">
+                            <div class="chat-header-name" id="msg-chat-name">Select a chat</div>
+                            <div class="chat-header-status" id="msg-chat-status"></div>
+                        </div>
+                    </div>
+                    <div class="chat-messages" id="msg-chat-messages">
+                        <div class="chat-empty-state">
+                            <i class="fas fa-comments"></i>
+                            <p>Select a chat from the left to view messages, send texts, and download files.</p>
+                        </div>
+                    </div>
+                    <div class="chat-input-bar" id="msg-chat-input-bar">
+                        <textarea id="msg-chat-input" placeholder="Type a message..." rows="1"></textarea>
+                        <button class="chat-send-btn" id="msg-send-btn" onclick="window.msgSendMessage()" title="Send message"><i class="fas fa-paper-plane"></i></button>
+                    </div>
+                </div>
             </div>
         </main>
     </div>
