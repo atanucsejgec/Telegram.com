@@ -157,7 +157,7 @@ async function loadDialogs(reset = true) {
   try {
     const result = await client.getDialogs({
       limit: 40,
-      offsetDate: dialogsOffset,
+      ...(dialogsOffset != null && { offsetDate: dialogsOffset }),
     });
 
     if (!result || result.length === 0) {

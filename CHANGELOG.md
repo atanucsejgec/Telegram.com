@@ -2,6 +2,22 @@
 
 All notable changes to the Telegram Drive Serverless project will be documented in this file.
 
+## [2026-07-30 12:17 AM IST]
+
+### Fixed
+- **Sidebar & View Navigation (`switchView`)**:
+  - Fixed issue where clicking sidebar items on desktop browsers would fail to navigate by preventing default link actions (`window.event.preventDefault()`).
+  - Mobile sidebar auto-closes when a view is selected on mobile screens ($\le$ 768px).
+  - Unified view routing for **Images**, **Videos**, **Audio**, and **Documents** to pass through `loadFiles()`, resolving missing file counts, grid layouts, sorting, and breadcrumbs.
+- **`file://` Protocol Compatibility**:
+  - Safe-wrapped all `history.pushState()` and `history.replaceState()` calls in `try/catch` blocks to prevent `SecurityError` exceptions on local `file://` contexts from blocking SPA view changes.
+- **Telegram Messenger Dialog Loading (`js/messenger.js`)**:
+  - Fixed `CastError` when loading dialogs by ensuring `offsetDate` parameter is omitted when `dialogsOffset` is `null`/`undefined`.
+- **Asset Paths (`index.html`)**:
+  - Updated favicon `<link>` tags to use absolute paths (`/favicon.png`).
+
+---
+
 ## [2026-07-29 01:26 PM IST]
 
 ### Added

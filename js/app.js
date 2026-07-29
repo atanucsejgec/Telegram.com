@@ -559,7 +559,7 @@ function showApp() {
 
   // Initialize initial history state if not set
   if (!history.state) {
-    history.replaceState({ view: currentView, folder: currentFolder }, "");
+    try { history.replaceState({ view: currentView, folder: currentFolder }, ""); } catch(e) {}
   }
 }
 
@@ -1614,7 +1614,7 @@ async function previewFile(id, pushHistory = true) {
   previewFileId = id;
   show("preview-modal");
   if (pushHistory && !isHandlingPopState) {
-    history.pushState({ view: currentView, folder: currentFolder, previewId: id }, "");
+    try { history.pushState({ view: currentView, folder: currentFolder, previewId: id }, ""); } catch(e) {}
   }
   await loadPreview(previewableFiles[previewIndex]);
 }
@@ -2017,7 +2017,7 @@ function showInfo(id) {
       </div>`;
     show("info-modal");
     if (!isHandlingPopState) {
-      history.pushState({ view: currentView, folder: currentFolder, modalId: "info-modal" }, "");
+      try { history.pushState({ view: currentView, folder: currentFolder, modalId: "info-modal" }, ""); } catch(e) {}
     }
   }
   hideContext();
@@ -2027,7 +2027,7 @@ function showInfo(id) {
 function showNewFolder() {
   closeModal("folder-modal"); show("folder-modal");
   if (!isHandlingPopState) {
-    history.pushState({ view: currentView, folder: currentFolder, modalId: "folder-modal" }, "");
+    try { history.pushState({ view: currentView, folder: currentFolder, modalId: "folder-modal" }, ""); } catch(e) {}
   }
   el("folder-name").value = ""; el("folder-name").focus();
   el("folder-color-picker").innerHTML = FOLDER_COLORS.map(c =>
@@ -2068,7 +2068,7 @@ function navFolder(id, pushHistory = true) {
   updateNav("files");
   currentFolder = id;
   if (pushHistory && !isHandlingPopState) {
-    history.pushState({ view: "files", folder: id }, "");
+    try { history.pushState({ view: "files", folder: id }, ""); } catch(e) {}
   }
   loadFiles(id);
 }
@@ -2144,7 +2144,7 @@ function showRename(type, id) {
   input.placeholder = type === "folder" ? "New folder name" : "New file name";
   show("rename-modal");
   if (!isHandlingPopState) {
-    history.pushState({ view: currentView, folder: currentFolder, modalId: "rename-modal" }, "");
+    try { history.pushState({ view: currentView, folder: currentFolder, modalId: "rename-modal" }, ""); } catch(e) {}
   }
 
   setTimeout(() => {
@@ -2192,7 +2192,7 @@ async function showMoveModal(ids, type) {
   tree.innerHTML = `<div class="tree-item${moveTargetId === 'root' ? ' active' : ''}" onclick="window.selectMoveTarget('root',this)"><i class="fas fa-hard-drive" style="color:var(--primary)"></i>My Drive</div>${renderTree(fileDatabase.folders, "root")}`;
   show("move-modal");
   if (!isHandlingPopState) {
-    history.pushState({ view: currentView, folder: currentFolder, modalId: "move-modal" }, "");
+    try { history.pushState({ view: currentView, folder: currentFolder, modalId: "move-modal" }, ""); } catch(e) {}
   }
 }
 
@@ -2249,13 +2249,26 @@ function handleSort(val) {
 }
 
 function switchView(view, pushHistory = true) {
+  if (window.event && window.event.preventDefault) {
+    window.event.preventDefault();
+  }
+
   // Close messenger if switching away from it
   if (currentView === "messenger" && view !== "messenger" && window.closeMessenger) {
     window.closeMessenger();
   }
+  
+  // Close sidebar on mobile
+  if (window.innerWidth <= 768) {
+    const sidebar = document.getElementById("sidebar");
+    if (sidebar && sidebar.classList.contains("open")) {
+      sidebar.classList.remove("open");
+    }
+  }
+
   currentView = view; updateNav(view);
   if (pushHistory && !isHandlingPopState) {
-    history.pushState({ view: view, folder: view === "files" ? currentFolder : "root" }, "");
+    try { history.pushState({ view: view, folder: view === "files" ? currentFolder : "root" }, ""); } catch(e) {}
   }
   if (view === "messenger") {
     // Hide drive-specific top bar elements
@@ -2269,10 +2282,12 @@ function switchView(view, pushHistory = true) {
   // Restore drive top bar elements when switching back
   if (el("sort-select")) el("sort-select").style.display = "";
   if (el("view-toggle")) el("view-toggle").style.display = "";
-  if (view === "files") { currentFolder = currentFolder || "root"; loadFiles(); }
-  else if (view === "recent" || view === "starred" || view === "trash") loadFiles();
-  else if (view === "telegram") loadTelegramView(true);
-  else loadFilteredView(view);
+  if (view === "telegram") {
+    loadTelegramView(true);
+  } else {
+    if (view === "files") currentFolder = currentFolder || "root";
+    loadFiles();
+  }
 }
 
 function updateNav(view) {
@@ -2849,6 +2864,7 @@ window.cancelConfirm = cancelConfirm;
 window.showShortcutsModal = showShortcutsModal;
 window.closeModal = closeModal;
 window.toggleSidebar = toggleSidebar;
+window.switchView = switchView;
 
 // ==================== LOGIN GUIDE CAROUSEL ====================
 let guideIndex = 0;
