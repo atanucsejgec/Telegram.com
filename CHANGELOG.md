@@ -2,6 +2,13 @@
 
 All notable changes to the Telegram Drive Serverless project will be documented in this file.
 
+## [2026-07-29 01:26 PM IST]
+
+### Added
+- **App Favicon**: Generated and added custom Telegram Drive branding favicon (`favicon.png`) with standard `<link rel="icon">` and `<link rel="apple-touch-icon">` tags in `index.html`.
+
+---
+
 ## [2026-07-29 01:17 PM IST]
 
 ### Added
