@@ -1051,7 +1051,9 @@ class DownloadTask {
     
     this.isPaused = false;
     this.isCancelled = false;
-    
+    this.sequential = sequential;
+    // Telegram upload.getFile limit MUST be a multiple of 4KB, up to 1MB (1048576) or 512KB (524288) for optimum TCP window utilization
+    // Using 1MB (1048576) for maximum throughput per RPC request
     this.CHUNK_SIZE = 1048576; // 1MB
     this.fileSize = Number(msg.media?.document?.size || 0);
     this.numChunks = Math.ceil(this.fileSize / this.CHUNK_SIZE);
@@ -1067,7 +1069,6 @@ class DownloadTask {
     this.statusLabel = item.querySelector(".upload-status");
     
     // Sequential mode for Service Worker streams (no random-access writes)
-    this.sequential = sequential;
     this.nextFlushIdx = 0;      // next chunk index to flush
     this.reorderBuf = new Map(); // chunkIdx -> Uint8Array
     
@@ -1173,7 +1174,8 @@ class DownloadTask {
   async spawnWorkers() {
     if (this.isPaused || this.isCancelled || this.currentChunk >= this.numChunks) return;
     
-    const WORKERS = 4;
+    // For mobile sequential streams, use 6 parallel workers to saturate connection and offset MessagePort IPC overhead
+    const WORKERS = this.sequential ? 6 : 4;
     const promises = [];
     
     for (let i = 0; i < WORKERS; i++) {
