@@ -2,7 +2,7 @@
 
 A Google Drive–style cloud storage app that uses **Telegram as its storage backend** — free and unlimited. It runs 100% in the browser (no backend server): the app talks to Telegram's API directly via [GramJS](https://gram.js.org/), so your files and credentials never touch any third-party server.
 
-**Live demo:** https://atanucsejgec.github.io/Telegram.com/
+**Live demo:** https://atanucsejgec.github.io/Telegram.com/ | 📖 **Technical Architecture:** [Architecture.md](Architecture.md)
 
 ## How it works
 

@@ -21,8 +21,8 @@ let searchTimeout = null;
 
 let activeDialog = null;   // { peer, title, type, entity }
 let chatMessages = [];
-let chatOffsetId = 0;
-let chatHasMore = true;
+let chatHasMoreOlder = true;
+let chatHasMoreNewer = false;
 let chatLoading = false;
 let mySelfId = null;
 let highlightMsgId = null;  // message ID to highlight after rendering
@@ -318,8 +318,8 @@ async function selectDialog(idx) {
 
   activeDialog = dlg;
   chatMessages = [];
-  chatOffsetId = 0;
-  chatHasMore = true;
+  chatHasMoreOlder = true;
+  chatHasMoreNewer = false;
 
   // Show chat on mobile
   const screen = el("messenger-screen");
@@ -360,33 +360,36 @@ async function loadChatMessages(reset = true) {
 
   if (reset) {
     chatMessages = [];
-    chatOffsetId = 0;
-    chatHasMore = true;
+    chatHasMoreOlder = true;
+    chatHasMoreNewer = false;
     if (container) container.innerHTML = `<div class="chat-loading"><div class="spinner"></div> Loading messages...</div>`;
   }
 
   try {
     const peer = activeDialog.inputEntity || activeDialog.entity;
     const opts = { limit: 50 };
-    if (chatOffsetId) opts.offsetId = chatOffsetId;
+
+    if (!reset && chatMessages.length > 0) {
+      const minId = Math.min(...chatMessages.map(m => m.id));
+      opts.offsetId = minId;
+    }
 
     const messages = await client.getMessages(peer, opts);
 
     if (!messages || messages.length === 0) {
-      chatHasMore = false;
+      chatHasMoreOlder = false;
     } else {
       for (const msg of messages) {
         if (!chatMessages.some(m => m.id === msg.id)) {
           chatMessages.push(msg);
         }
       }
-      chatOffsetId = messages[messages.length - 1].id;
-      if (messages.length < 50) chatHasMore = false;
+      if (messages.length < 50) chatHasMoreOlder = false;
     }
   } catch (e) {
     console.error("Failed to load messages:", e);
     toast("Failed to load messages: " + (e.message || e), "error");
-    chatHasMore = false;
+    chatHasMoreOlder = false;
   }
 
   chatLoading = false;
@@ -407,47 +410,40 @@ async function loadChatMessagesAround(targetMsgId) {
   chatLoading = true;
   const container = el("msg-chat-messages");
   chatMessages = [];
-  chatHasMore = true;
+  chatHasMoreOlder = true;
+  chatHasMoreNewer = true;
 
   if (container) container.innerHTML = `<div class="chat-loading"><div class="spinner"></div> Jumping to message...</div>`;
 
   try {
     const peer = activeDialog.inputEntity || activeDialog.entity;
 
-    // Fetch messages BEFORE the target (older) — offsetId = targetMsgId+1 gets messages <= targetMsgId
-    const olderMsgs = await client.getMessages(peer, {
-      limit: 25,
-      offsetId: targetMsgId + 1,
+    // GramJS: limit: 50, offsetId: targetMsgId, addOffset: -25 fetches ~25 messages after targetMsgId and ~25 before.
+    let messages = await client.getMessages(peer, {
+      limit: 50,
+      offsetId: targetMsgId,
+      addOffset: -25,
     });
 
-    // Fetch messages AFTER the target (newer) — use minId = targetMsgId-1 with reverse
-    // GramJS: offsetId=0, minId=targetMsgId-1 gets messages with id > targetMsgId-1 (i.e. >= targetMsgId)
-    const newerMsgs = await client.getMessages(peer, {
-      limit: 25,
-      minId: targetMsgId - 1,
-    });
+    if (!messages || messages.length === 0) {
+      messages = await client.getMessages(peer, {
+        limit: 50,
+        offsetId: targetMsgId + 1,
+      });
+    }
 
-    // Merge and deduplicate
-    const allMsgs = [...(olderMsgs || []), ...(newerMsgs || [])];
-    const seenIds = new Set();
-    for (const msg of allMsgs) {
-      if (msg && !seenIds.has(msg.id)) {
-        seenIds.add(msg.id);
-        chatMessages.push(msg);
+    if (messages && messages.length > 0) {
+      for (const msg of messages) {
+        if (msg && !chatMessages.some(m => m.id === msg.id)) {
+          chatMessages.push(msg);
+        }
       }
     }
-
-    // Set offset for "load older" pagination
-    const sorted = chatMessages.sort((a, b) => a.id - b.id);
-    if (sorted.length > 0) {
-      chatOffsetId = sorted[0].id;
-    }
-    chatHasMore = sorted.length > 0 && sorted[0].id > 1;
-
   } catch (e) {
     console.error("Failed to load messages around target:", e);
     toast("Failed to jump to message: " + (e.message || e), "error");
-    chatHasMore = false;
+    chatHasMoreOlder = false;
+    chatHasMoreNewer = false;
   }
 
   chatLoading = false;
@@ -464,9 +460,58 @@ async function loadChatMessagesAround(targetMsgId) {
     } else if (container) {
       container.scrollTop = container.scrollHeight;
     }
-    // Clear highlight after animation
-    setTimeout(() => { highlightMsgId = null; }, 3000);
+    // Clear highlight after 5 seconds
+    setTimeout(() => {
+      highlightMsgId = null;
+      if (targetEl) targetEl.classList.remove("msg-highlight");
+    }, 5000);
   });
+}
+
+// Load newer messages (when scrolled down after jumping to a link)
+async function loadMoreNewerMessages() {
+  const client = getClient();
+  if (!client || !activeDialog || chatLoading || !chatHasMoreNewer) return;
+  if (chatMessages.length === 0) return;
+
+  chatLoading = true;
+  try {
+    const peer = activeDialog.inputEntity || activeDialog.entity;
+    const maxId = Math.max(...chatMessages.map(m => m.id));
+
+    const newerBatch = await client.getMessages(peer, {
+      limit: 50,
+      offsetId: maxId + 1,
+      addOffset: -50,
+    });
+
+    let addedCount = 0;
+    if (newerBatch && newerBatch.length > 0) {
+      for (const msg of newerBatch) {
+        if (msg && msg.id > maxId && !chatMessages.some(m => m.id === msg.id)) {
+          chatMessages.push(msg);
+          addedCount++;
+        }
+      }
+    }
+
+    if (addedCount === 0 || (newerBatch && newerBatch.length < 50)) {
+      chatHasMoreNewer = false;
+    }
+  } catch (e) {
+    console.error("Failed to load newer messages:", e);
+    chatHasMoreNewer = false;
+  }
+
+  chatLoading = false;
+  renderChatMessages();
+}
+
+function getMsgGroupedId(msg) {
+  if (!msg) return null;
+  if (msg.groupedId !== undefined && msg.groupedId !== null) return msg.groupedId.toString();
+  if (msg.grouped_id !== undefined && msg.grouped_id !== null) return msg.grouped_id.toString();
+  return null;
 }
 
 // ── Render Messages ──
@@ -474,7 +519,7 @@ function renderChatMessages() {
   const container = el("msg-chat-messages");
   if (!container) return;
 
-  if (chatMessages.length === 0 && !chatHasMore) {
+  if (chatMessages.length === 0 && !chatHasMoreOlder && !chatHasMoreNewer) {
     container.innerHTML = `<div class="chat-empty-state"><i class="fas fa-comments"></i><p>No messages yet. Start the conversation!</p></div>`;
     return;
   }
@@ -487,26 +532,162 @@ function renderChatMessages() {
   // Sort oldest-first for display
   const sorted = [...chatMessages].sort((a, b) => a.id - b.id);
 
+  // Group consecutive messages sharing the same non-null groupedId
+  const groups = [];
+  let currentGroup = null;
+
+  for (const msg of sorted) {
+    const gid = getMsgGroupedId(msg);
+    if (gid && gid !== "0" && currentGroup && currentGroup.gid === gid) {
+      currentGroup.messages.push(msg);
+    } else {
+      currentGroup = {
+        gid: (gid && gid !== "0") ? gid : null,
+        messages: [msg],
+      };
+      groups.push(currentGroup);
+    }
+  }
+
   let html = "";
 
-  if (chatHasMore) {
+  if (chatHasMoreOlder) {
     html += `<div class="chat-load-more" onclick="window.msgLoadMoreMessages()"><i class="fas fa-chevron-up"></i> Load older messages</div>`;
   }
 
   let lastDateStr = "";
-  for (const msg of sorted) {
-    // Date separator
-    const msgDate = msg.date ? new Date(msg.date * 1000) : null;
+  for (const group of groups) {
+    const primaryMsg = group.messages.find(m => m.message) || group.messages[0];
+    const msgDate = primaryMsg.date ? new Date(primaryMsg.date * 1000) : null;
     const dateStr = msgDate ? fmtMsgDate(msgDate) : "";
     if (dateStr && dateStr !== lastDateStr) {
       html += `<div class="msg-date-sep"><span>${dateStr}</span></div>`;
       lastDateStr = dateStr;
     }
 
-    html += renderSingleMessage(msg);
+    html += renderMessageGroup(group);
+  }
+
+  if (chatHasMoreNewer) {
+    html += `<div class="chat-load-more chat-load-newer" onclick="window.msgLoadMoreNewerMessages()"><i class="fas fa-chevron-down"></i> Load newer messages</div>`;
   }
 
   container.innerHTML = html;
+}
+
+function renderMessageGroup(group) {
+  if (!group || !group.messages || group.messages.length === 0) return "";
+  const messages = group.messages;
+
+  if (messages.length === 1) {
+    return renderSingleMessage(messages[0]);
+  }
+
+  // Multi-message album / group
+  const primaryMsg = messages.find(m => m.message) || messages[0];
+
+  // Determine outgoing vs incoming
+  const fromId = primaryMsg.fromId?.userId || primaryMsg.peerId?.userId;
+  const isOutgoing = primaryMsg.out || (mySelfId && fromId && BigInt(fromId) === BigInt(mySelfId));
+  const direction = isOutgoing ? "outgoing" : "incoming";
+
+  // Sender name (for groups/channels)
+  let senderHtml = "";
+  if (!isOutgoing && activeDialog && (activeDialog.type === "group" || activeDialog.type === "channel")) {
+    let senderName = "";
+    const senderObj = messages.find(m => m._sender)?._sender;
+    if (senderObj) {
+      senderName = [senderObj.firstName, senderObj.lastName].filter(Boolean).join(" ") || senderObj.title || "";
+    }
+    if (senderName) {
+      senderHtml = `<div class="msg-sender">${esc(senderName)}</div>`;
+    }
+  }
+
+  // Time
+  const time = primaryMsg.date ? fmtMsgTime(new Date(primaryMsg.date * 1000)) : "";
+
+  // Message text
+  let textHtml = "";
+  const textParts = [];
+  for (const m of messages) {
+    if (m.message && !textParts.includes(m.message)) {
+      textParts.push(m.message);
+    }
+  }
+  if (textParts.length > 0) {
+    const combined = textParts.join("\n\n");
+    const linked = esc(combined).replace(
+      /(https?:\/\/[^\s<]+)/g,
+      (url) => {
+        const parsed = parseTgLink(url);
+        if (parsed) {
+          return `<a href="#" onclick="event.preventDefault(); event.stopPropagation(); window.msgOpenTgLink('${url}');" style="color:var(--primary-light);text-decoration:underline;font-weight:600;" title="Jump to Telegram message">${url}</a>`;
+        }
+        return `<a href="${url}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline">${url}</a>`;
+      }
+    );
+    textHtml = `<div>${linked}</div>`;
+  }
+
+  // Media / File attachments for ALL messages in the group
+  let mediaHtml = "";
+  for (const msg of messages) {
+    if (!msg.media) continue;
+
+    if (msg.media.photo) {
+      mediaHtml += `<div class="msg-file-card" onclick="window.msgDownloadMedia(${msg.id})" title="Click to download photo">
+        <div class="msg-file-icon"><i class="fas fa-image"></i></div>
+        <div class="msg-file-info">
+          <div class="msg-file-name">Photo</div>
+          <div class="msg-file-size">Click to download</div>
+        </div>
+        <button class="msg-file-dl" onclick="event.stopPropagation();window.msgDownloadMedia(${msg.id})"><i class="fas fa-download"></i></button>
+      </div>`;
+    } else if (msg.media.document) {
+      const doc = msg.media.document;
+      const nameAttr = doc.attributes?.find(a => a.fileName);
+      const fileName = nameAttr?.fileName || `File_${msg.id}`;
+      const fileSize = Number(doc.size) || 0;
+      const mime = doc.mimeType || "";
+      const icon = fileIconClass(mime, fileName);
+
+      mediaHtml += `<div class="msg-file-card" onclick="window.msgDownloadMedia(${msg.id})" title="Click to download ${esc(fileName)}">
+        <div class="msg-file-icon"><i class="${icon}"></i></div>
+        <div class="msg-file-info">
+          <div class="msg-file-name">${esc(fileName)}</div>
+          <div class="msg-file-size">${fmtBytes(fileSize)}</div>
+        </div>
+        <button class="msg-file-dl" onclick="event.stopPropagation();window.msgDownloadMedia(${msg.id})" title="Download ${esc(fileName)}"><i class="fas fa-download"></i></button>
+      </div>`;
+    } else if (msg.media.webpage) {
+      // Ignore web page previews — link is already in text
+    } else {
+      mediaHtml += `<div class="msg-file-card" onclick="window.msgDownloadMedia(${msg.id})" title="Click to download">
+        <div class="msg-file-icon"><i class="fas fa-paperclip"></i></div>
+        <div class="msg-file-info">
+          <div class="msg-file-name">Media</div>
+          <div class="msg-file-size">Click to download</div>
+        </div>
+        <button class="msg-file-dl" onclick="event.stopPropagation();window.msgDownloadMedia(${msg.id})"><i class="fas fa-download"></i></button>
+      </div>`;
+    }
+  }
+
+  // Skip empty
+  if (!textHtml && !mediaHtml) return "";
+
+  const isHighlighted = messages.some(m => highlightMsgId && m.id === highlightMsgId);
+  const highlightClass = isHighlighted ? " msg-highlight" : "";
+
+  return `<div class="msg-row ${direction}${highlightClass}" data-msg-id="${primaryMsg.id}">
+    ${senderHtml}
+    <div class="msg-bubble">
+      ${textHtml}
+      ${mediaHtml}
+    </div>
+    <span class="msg-time">${time}</span>
+  </div>`;
 }
 
 function renderSingleMessage(msg) {
@@ -535,10 +716,16 @@ function renderSingleMessage(msg) {
   // Message text
   let textHtml = "";
   if (msg.message) {
-    // Linkify URLs
+    // Linkify URLs — intercept Telegram t.me links for in-app jumping
     const linked = esc(msg.message).replace(
       /(https?:\/\/[^\s<]+)/g,
-      '<a href="$1" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline">$1</a>'
+      (url) => {
+        const parsed = parseTgLink(url);
+        if (parsed) {
+          return `<a href="#" onclick="event.preventDefault(); event.stopPropagation(); window.msgOpenTgLink('${url}');" style="color:var(--primary-light);text-decoration:underline;font-weight:600;" title="Jump to Telegram message">${url}</a>`;
+        }
+        return `<a href="${url}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline">${url}</a>`;
+      }
     );
     textHtml = `<div>${linked}</div>`;
   }
@@ -792,14 +979,105 @@ async function loadMoreMessages() {
   }
 }
 
-// ── Search System ──
-// Detects: (1) t.me link → fetch specific message  (2) text query → global file search  (3) short text → local dialog filter
+// ── Search System & Telegram Link Resolution ──
+// Detects: (1) t.me link → fetch & jump to message  (2) text query → global file search  (3) short text → local dialog filter
 
-const TG_LINK_RE = /(?:https?:\/\/)?(?:t\.me|telegram\.me)\/([\w.]+)\/(\d+)/i;
+function parseTgLink(url) {
+  if (!url) return null;
+  const clean = url.trim();
+
+  // Private channel link: t.me/c/<channel_id>/<msg_id>
+  const privateMatch = clean.match(/(?:https?:\/\/)?(?:t\.me|telegram\.me)\/c\/(\d+)(?:\/(\d+))?/i);
+  if (privateMatch) {
+    return {
+      isPrivate: true,
+      channelId: privateMatch[1],
+      peerKey: "-100" + privateMatch[1],
+      msgId: privateMatch[2] ? parseInt(privateMatch[2]) : null
+    };
+  }
+
+  // Public channel/user link: t.me/<username>/<msg_id>
+  const publicMatch = clean.match(/(?:https?:\/\/)?(?:t\.me|telegram\.me)\/([a-zA-Z0-9_]+)(?:\/(\d+))?/i);
+  if (publicMatch && publicMatch[1].toLowerCase() !== "c") {
+    return {
+      isPrivate: false,
+      username: publicMatch[1],
+      peerKey: publicMatch[1],
+      msgId: publicMatch[2] ? parseInt(publicMatch[2]) : null
+    };
+  }
+
+  return null;
+}
+
+const TG_LINK_RE = /(?:https?:\/\/)?(?:t\.me|telegram\.me)\/(?:c\/\d+|[\w.]+)(?:\/\d+)?/i;
+
+async function openTgLink(url) {
+  const parsed = parseTgLink(url);
+  if (!parsed) return toast("Invalid Telegram link", "error");
+
+  const client = getClient();
+  if (!client) return toast("Not connected to Telegram", "error");
+
+  toast("Resolving Telegram link...", "info");
+
+  try {
+    let peer;
+    if (parsed.isPrivate) {
+      try {
+        peer = await client.getEntity(parsed.peerKey);
+      } catch {
+        peer = await client.getEntity(BigInt(parsed.channelId));
+      }
+    } else {
+      peer = await client.getEntity(parsed.username);
+    }
+
+    if (!peer) throw new Error("Channel or chat not found");
+
+    let title = peer.title || [peer.firstName, peer.lastName].filter(Boolean).join(" ") || "Chat";
+    let type = "user";
+    if (peer.className === "Channel") type = peer.megagroup ? "group" : "channel";
+    else if (peer.className === "Chat") type = "group";
+    else if (peer.self) type = "saved";
+
+    activeDialog = {
+      _id: peer.id?.toString() || Math.random().toString(),
+      title,
+      type,
+      unreadCount: 0,
+      lastMessage: "",
+      lastDate: null,
+      peerId: peer.id,
+      entity: peer,
+      inputEntity: peer,
+    };
+
+    openMessenger();
+    const screen = el("messenger-screen");
+    if (screen) screen.classList.add("chat-open");
+
+    clearSearch();
+    renderChatHeader();
+
+    if (parsed.msgId) {
+      await loadChatMessagesAround(parsed.msgId);
+      toast(`Jumped to message #${parsed.msgId} in ${title}`, "success");
+    } else {
+      await loadChatMessages(true);
+      toast(`Opened ${title}`, "success");
+    }
+
+  } catch (err) {
+    console.error("Failed to open Telegram link:", err);
+    toast("Could not open link: " + (err.message || err), "error");
+  }
+}
 
 function detectSearchMode(value) {
   if (!value || !value.trim()) return null;
-  if (TG_LINK_RE.test(value.trim())) return "link";
+  if (parseTgLink(value.trim())) return "link";
   if (value.trim().length >= 3) return "file";
   return null;
 }
@@ -862,7 +1140,11 @@ function handleDialogSearch(value) {
 
 async function executeSearch(query) {
   const client = getClient();
-  if (!client) return;
+  if (!client || !query) return;
+
+  if (!searchMode) {
+    searchMode = detectSearchMode(query);
+  }
 
   const resultsPanel = el("msg-search-results");
   const dialogList = el("messenger-dialog-list");
@@ -895,34 +1177,57 @@ async function executeSearch(query) {
 // ── Search by t.me Link ──
 async function searchByLink(query) {
   const client = getClient();
-  const match = query.trim().match(TG_LINK_RE);
-  if (!match) throw new Error("Invalid link");
-
-  const channelUsername = match[1];
-  const messageId = parseInt(match[2]);
+  const parsed = parseTgLink(query);
+  if (!parsed) throw new Error("Invalid link");
 
   // Resolve the channel/chat entity
   let peer;
   try {
-    peer = await client.getEntity(channelUsername);
+    if (parsed.isPrivate) {
+      try {
+        peer = await client.getEntity(parsed.peerKey);
+      } catch {
+        peer = await client.getEntity(BigInt(parsed.channelId));
+      }
+    } else {
+      peer = await client.getEntity(parsed.username);
+    }
   } catch (e) {
     console.error("Could not resolve entity:", e);
-    searchResults = [{ _error: true, text: `Could not find channel "@${channelUsername}". Make sure the channel exists and is accessible.` }];
+    searchResults = [{ _error: true, text: `Could not find chat for link "${query}". Make sure it is accessible.` }];
     return;
   }
 
-  // Fetch the specific message
-  try {
-    const msgs = await client.getMessages(peer, { ids: [messageId] });
-    if (!msgs || !msgs[0]) {
-      searchResults = [{ _error: true, text: `Message #${messageId} not found in @${channelUsername}.` }];
-      return;
+  if (parsed.msgId) {
+    // Fetch the specific message
+    try {
+      const msgs = await client.getMessages(peer, { ids: [parsed.msgId] });
+      if (!msgs || !msgs[0]) {
+        searchResults = [{ _error: true, text: `Message #${parsed.msgId} not found in this chat.` }];
+        return;
+      }
+      const msg = msgs[0];
+      searchResults = [normalizeSearchResult(msg, peer)];
+    } catch (e) {
+      console.error("Could not fetch message:", e);
+      searchResults = [{ _error: true, text: `Failed to fetch message: ${e.message || e}` }];
     }
-    const msg = msgs[0];
-    searchResults = [normalizeSearchResult(msg, peer)];
-  } catch (e) {
-    console.error("Could not fetch message:", e);
-    searchResults = [{ _error: true, text: `Failed to fetch message: ${e.message || e}` }];
+  } else {
+    // Only chat handle link
+    let title = peer.title || [peer.firstName, peer.lastName].filter(Boolean).join(" ") || "Chat";
+    searchResults = [{
+      msgId: 0,
+      fileName: title,
+      fileSize: 0,
+      mime: "",
+      type: "chat",
+      hasMedia: false,
+      text: `Channel / Chat: ${title}`,
+      chatName: title,
+      chatEntity: peer,
+      date: new Date(),
+      raw: null
+    }];
   }
 }
 
@@ -1146,6 +1451,11 @@ async function searchOpenChat(idx) {
     return;
   }
 
+  let inputEntity = peer;
+  try {
+    inputEntity = await client.getInputEntity(peer);
+  } catch (e) {}
+
   // Create a synthetic dialog-like object and open it
   let title = peer.title || [peer.firstName, peer.lastName].filter(Boolean).join(" ") || "Chat";
   let type = "user";
@@ -1162,15 +1472,21 @@ async function searchOpenChat(idx) {
     lastDate: null,
     peerId: peer.id,
     entity: peer,
-    inputEntity: peer,
+    inputEntity: inputEntity || peer,
   };
 
   chatMessages = [];
-  chatOffsetId = 0;
-  chatHasMore = true;
+  chatHasMoreOlder = true;
+  chatHasMoreNewer = true;
 
   // Save the target message ID before clearing search
   const targetMsgId = r.msgId;
+
+  // Open messenger screen & view if not already active
+  openMessenger();
+  if (window.switchView && window.currentView !== "messenger") {
+    window.switchView("messenger", false);
+  }
 
   // Clear search and show chat
   clearSearch();
@@ -1191,7 +1507,9 @@ async function searchOpenChat(idx) {
 
 function clearSearch() {
   const input = el("msg-dialog-search");
+  const topInput = el("search-input");
   const clearBtn = el("msg-search-clear");
+  const topClearBtn = el("search-clear");
   const hint = el("msg-search-hint");
   const resultsPanel = el("msg-search-results");
   const dialogList = el("messenger-dialog-list");
@@ -1202,7 +1520,9 @@ function clearSearch() {
   clearTimeout(searchTimeout);
 
   if (input) input.value = "";
+  if (topInput && window.currentView === "messenger") topInput.value = "";
   if (clearBtn) clearBtn.classList.add("hidden");
+  if (topClearBtn && window.currentView === "messenger") topClearBtn.classList.add("hidden");
   if (hint) { hint.classList.add("hidden"); hint.className = "msg-search-hint hidden"; }
   if (resultsPanel) { resultsPanel.classList.add("hidden"); resultsPanel.innerHTML = ""; }
   if (dialogList) dialogList.style.display = "";
@@ -1261,11 +1581,15 @@ window.closeMessenger = closeMessenger;
 window.msgSelectDialog = selectDialog;
 window.msgLoadMoreDialogs = loadMoreDialogs;
 window.msgLoadMoreMessages = loadMoreMessages;
+window.msgLoadMoreNewerMessages = loadMoreNewerMessages;
 window.msgSendMessage = sendMessage;
 window.msgDownloadMedia = downloadMedia;
 window.msgChatBack = chatBack;
 window.chatBack = chatBack;
 window.msgHandleDialogSearch = handleDialogSearch;
+window.msgExecuteSearch = executeSearch;
 window.msgClearSearch = clearSearch;
 window.msgSearchDownload = searchDownload;
 window.msgSearchOpenChat = searchOpenChat;
+window.msgOpenTgLink = openTgLink;
+window.parseTgLink = parseTgLink;

@@ -4,6 +4,7 @@ import { CustomFile } from "telegram/client/uploads";
 import { computeCheck } from "telegram/Password";
 import { Buffer } from "buffer";
 import { zip } from "fflate";
+import { getThumbFromIDB, saveThumbToIDB } from "./idb-cache.js";
 
 let client = null;
 let targetPeer = "me";
@@ -31,6 +32,7 @@ let selectedFolderColor = "#ffab00";
 
 let searchTimeout = null;
 let dragCounter = 0;
+let isDraggingInternal = false;
 let confirmResolve = null;
 let renameTarget = null;
 let moveTargetId = "root";
@@ -41,6 +43,187 @@ let previewableFiles = [];
 
 const objectUrlCache = new Map();
 const fetchingPromises = new Map();
+const activeUploadTasks = new Map();
+let focusedGridIndex = -1;
+let lastClickedId = null;
+
+// ==================== DRAG & DROP MOVE HELPERS ====================
+window.handleDragStart = function(e, itemId, type = 'file') {
+  isDraggingInternal = true;
+  e.dataTransfer.setData("text/plain", JSON.stringify({ id: itemId, type: type }));
+  e.dataTransfer.effectAllowed = "move";
+};
+
+window.handleDragEnd = function(e) {
+  isDraggingInternal = false;
+  dragCounter = 0;
+  const dz = el("drop-zone");
+  if (dz) dz.classList.remove("active");
+};
+
+window.handleDragOver = function(e) {
+  e.preventDefault();
+  e.stopPropagation();
+  e.dataTransfer.dropEffect = "move";
+  const target = e.currentTarget;
+  if (target) target.classList.add("drag-hover");
+};
+
+window.handleDragLeave = function(e) {
+  e.preventDefault();
+  e.stopPropagation();
+  const target = e.currentTarget;
+  if (target) target.classList.remove("drag-hover");
+};
+
+window.handleDrop = function(e, targetFolderId) {
+  e.preventDefault();
+  e.stopPropagation();
+  const target = e.currentTarget;
+  if (target) target.classList.remove("drag-hover");
+  
+  isDraggingInternal = false;
+  dragCounter = 0;
+  const dz = el("drop-zone");
+  if (dz) dz.classList.remove("active");
+
+  let itemId = null;
+  const rawData = e.dataTransfer.getData("text/plain");
+  if (rawData) {
+    try {
+      const parsed = JSON.parse(rawData);
+      itemId = parsed.id;
+    } catch (_) {
+      itemId = rawData;
+    }
+  }
+
+  if (itemId && targetFolderId) {
+    let itemsToMove = [];
+    if (selectedItems.has(itemId)) {
+      itemsToMove = Array.from(selectedItems);
+    } else {
+      itemsToMove = [itemId];
+    }
+
+    let movedCount = 0;
+    itemsToMove.forEach(id => {
+      if (id === targetFolderId) return;
+      
+      const file = fileDatabase.files.find(f => f.id === id);
+      if (file && file.folderId !== targetFolderId) {
+        file.folderId = targetFolderId;
+        movedCount++;
+      }
+      
+      const folder = fileDatabase.folders.find(f => f.id === id);
+      if (folder && folder.parentId !== targetFolderId) {
+        const subIds = getAllSubFolderIds(folder.id);
+        if (!subIds.includes(targetFolderId)) {
+          folder.parentId = targetFolderId;
+          movedCount++;
+        }
+      }
+    });
+
+    if (movedCount > 0) {
+      saveDBToTelegram().then(() => {
+        loadFiles();
+        toast(`Moved ${movedCount} item${movedCount > 1 ? 's' : ''} to folder`, "success");
+      });
+    }
+  }
+};
+
+// Network status listeners
+window.addEventListener("online", () => {
+  toast("Network connection restored", "success");
+  if (client && !client.connected) client.connect().catch(() => {});
+});
+window.addEventListener("offline", () => {
+  toast("Network connection lost. Working offline...", "warning");
+});
+
+// ==================== MULTI-TAB SYNC & BROADCAST ====================
+if ('BroadcastChannel' in window) {
+  window.syncChannel = new BroadcastChannel('tg_drive_sync');
+  window.syncChannel.onmessage = (event) => {
+    if (event.data?.type === 'DB_SAVED') {
+      toast("Drive updated from another tab. Syncing...", "info");
+      loadDBFromTelegram().then(() => loadFiles());
+    }
+  };
+}
+
+// ==================== FLOOD_WAIT & RETRY HELPERS ====================
+async function callWithRetry(fn, maxRetries = 3) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const errMsg = err?.errorMessage || err?.message || "";
+      if (errMsg.includes("FLOOD_WAIT_")) {
+        const secs = parseInt(errMsg.split("FLOOD_WAIT_")[1], 10) || 5;
+        toast(`Telegram rate limit. Auto-resuming in ${secs}s...`, "warning");
+        await new Promise(r => setTimeout(r, (secs + 1) * 1000));
+        continue;
+      }
+      if (attempt === maxRetries) throw err;
+      await new Promise(r => setTimeout(r, attempt * 1000));
+    }
+  }
+}
+
+// ==================== OBJECT URL & THUMBNAIL CACHE ====================
+async function getFileObjectUrl(id, isThumb = false) {
+  const cacheKey = id + (isThumb ? "_thumb" : "_full");
+  if (objectUrlCache.has(cacheKey)) {
+    return objectUrlCache.get(cacheKey);
+  }
+  if (fetchingPromises.has(cacheKey)) {
+    return fetchingPromises.get(cacheKey);
+  }
+
+  const promise = (async () => {
+    try {
+      if (isThumb) {
+        const cachedBlob = await getThumbFromIDB(id);
+        if (cachedBlob) {
+          const url = URL.createObjectURL(cachedBlob);
+          objectUrlCache.set(cacheKey, url);
+          return url;
+        }
+      }
+
+      const file = fileDatabase.files.find(f => f.id === id) || allFiles.find(f => f.id === id);
+      if (!file || !file.messageId) return null;
+
+      const messages = await callWithRetry(() => client.getMessages(targetPeer, { ids: [file.messageId] }));
+      if (!messages?.[0]) return null;
+
+      const buffer = await callWithRetry(() => client.downloadMedia(messages[0], {
+        thumb: isThumb ? 0 : undefined
+      }));
+      if (!buffer) return null;
+
+      const blob = new Blob([buffer], { type: file.mimeType || "application/octet-stream" });
+      if (isThumb) {
+        await saveThumbToIDB(id, blob);
+      }
+      const url = URL.createObjectURL(blob);
+      objectUrlCache.set(cacheKey, url);
+      return url;
+    } catch (e) {
+      console.warn("getFileObjectUrl error:", e);
+      return null;
+    } finally {
+      fetchingPromises.delete(cacheKey);
+    }
+  })();
+
+  fetchingPromises.set(cacheKey, promise);
+  return promise;
+}
 
 // ==================== SPA HISTORY & BACK BUTTON MANAGEMENT ====================
 let isHandlingPopState = false;
@@ -48,6 +231,7 @@ window.isHandlingPopState = false;
 
 // ==================== INIT ====================
 document.addEventListener("DOMContentLoaded", () => {
+  initTheme();
   addLoadingParticles();
   initCredentialsUI();
   checkAuth();
@@ -55,6 +239,7 @@ document.addEventListener("DOMContentLoaded", () => {
   setupKeys();
   setupRipples();
   registerDownloadSW();
+  registerAppSW();
   document.addEventListener("click", e => {
     if (!document.getElementById("context-menu").contains(e.target)) hideContext();
   });
@@ -80,6 +265,42 @@ function registerDownloadSW() {
     })
     .catch(err => console.warn('Download SW registration failed:', err));
 }
+
+function registerAppSW() {
+  if (!('serviceWorker' in navigator)) return;
+  navigator.serviceWorker.register('./sw.js')
+    .then(reg => console.log('App SW registered, scope:', reg.scope))
+    .catch(err => console.warn('App SW registration failed:', err));
+}
+
+let deferredPrompt = null;
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  deferredPrompt = e;
+  const btn = document.getElementById('pwa-install-btn');
+  if (btn) btn.classList.remove('hidden');
+});
+
+function installPwa() {
+  if (!deferredPrompt) {
+    if (window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone) {
+      toast("Telegram Drive is already running as an installed PWA app!", "info");
+    } else {
+      toast("To install: Use your browser menu (⋮ or Share) → 'Install App' or 'Add to Home Screen'.", "info");
+    }
+    return;
+  }
+  deferredPrompt.prompt();
+  deferredPrompt.userChoice.then((result) => {
+    if (result.outcome === 'accepted') {
+      toast("App installed successfully!", "success");
+    }
+    deferredPrompt = null;
+    const btn = document.getElementById('pwa-install-btn');
+    if (btn) btn.classList.add('hidden');
+  });
+}
+window.installPwa = installPwa;
 
 /** Adapter that wraps a MessagePort to look like a WritableFileStream for DownloadTask */
 class SwWritableAdapter {
@@ -348,11 +569,11 @@ async function saveDBToTelegram() {
     const buffer = Buffer.from(uint8Array.buffer, uint8Array.byteOffset, uint8Array.byteLength);
     const dbFile = new CustomFile("filedb.json", buffer.length, "", buffer);
     
-    const result = await client.sendFile(targetPeer, {
+    const result = await callWithRetry(() => client.sendFile(targetPeer, {
       file: dbFile,
       caption: `#TelegramDriveDatabase\nThis message stores your Telegram Drive database. Do not delete it.`,
       forceDocument: true
-    });
+    }));
     
     const oldId = dbMessageId;
     dbMessageId = result.id;
@@ -373,6 +594,10 @@ async function saveDBToTelegram() {
       } catch (err) {
         console.warn("Could not delete old database message:", err);
       }
+    }
+
+    if (window.syncChannel) {
+      window.syncChannel.postMessage({ type: "DB_SAVED", timestamp: Date.now() });
     }
   } catch (e) {
     console.error("Error saving database to Telegram:", e);
@@ -401,48 +626,7 @@ function getMimeType(name, defaultMime = "application/octet-stream") {
   return "application/octet-stream";
 }
 
-// ==================== ASYNC MEDIA DOWNLOAD CACHE ====================
-async function getFileObjectUrl(fileId, forThumbnail = false) {
-  const cacheKey = `${fileId}_${forThumbnail ? 'thumb' : 'full'}`;
-  if (objectUrlCache.has(cacheKey)) return objectUrlCache.get(cacheKey);
-  
-  if (fetchingPromises.has(cacheKey)) return fetchingPromises.get(cacheKey);
 
-  const p = (async () => {
-    const file = allFiles.find(f => f.id === fileId);
-    if (!file) return null;
-
-    try {
-      const messages = await client.getMessages(targetPeer, { ids: [file.messageId] });
-      if (!messages?.[0]) throw new Error("Message not found on Telegram");
-
-      const message = messages[0];
-      let buffer;
-      if (forThumbnail && message.media?.document?.thumbs?.length) {
-        buffer = await client.downloadMedia(message.media.document, { thumb: 0 });
-      } else {
-        buffer = await client.downloadMedia(message, {});
-      }
-
-      if (!buffer) throw new Error("Download failed");
-      
-      const mime = getMimeType(file.name, file.mimeType);
-      const rawUint8 = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-      const blob = new Blob([rawUint8], { type: mime });
-      const url = URL.createObjectURL(blob);
-      objectUrlCache.set(cacheKey, url);
-      return url;
-    } catch (e) {
-      console.error(`Error downloading file media for ${file.name}:`, e);
-      return null;
-    } finally {
-      fetchingPromises.delete(cacheKey);
-    }
-  })();
-
-  fetchingPromises.set(cacheKey, p);
-  return p;
-}
 
 // ==================== LOADING PARTICLES ====================
 function addLoadingParticles() {
@@ -560,6 +744,47 @@ function showApp() {
   // Initialize initial history state if not set
   if (!history.state) {
     try { history.replaceState({ view: currentView, folder: currentFolder }, ""); } catch(e) {}
+  }
+  checkOnboardingTour();
+  checkUrlParameters();
+}
+
+function highlightFileCard(fileId, duration = 5000) {
+  if (!fileId) return;
+  const card = document.querySelector(`.file-card[data-id="${fileId}"]`);
+  if (card) {
+    card.scrollIntoView({ behavior: "smooth", block: "center" });
+    card.classList.add("file-highlight");
+    setTimeout(() => {
+      card.classList.remove("file-highlight");
+    }, duration);
+  }
+}
+
+function checkUrlParameters() {
+  const urlParams = new URLSearchParams(window.location.search);
+  const fileId = urlParams.get("file");
+  if (fileId) {
+    setTimeout(() => {
+      const file = fileDatabase.files.find(f => f.id === fileId);
+      if (file && !file.trashed) {
+        if (file.folderId && file.folderId !== "root") {
+          navFolder(file.folderId);
+        } else if (currentView !== "files") {
+          switchView("files");
+        }
+
+        setTimeout(() => {
+          highlightFileCard(fileId, 5000);
+          if (typeof window.previewFile === "function") {
+            window.previewFile(fileId);
+            toast(`Opened shared file: ${file.name}`, "info");
+          }
+        }, 300);
+      } else {
+        toast("Shared file not found or has been removed.", "warning");
+      }
+    }, 800);
   }
 }
 
@@ -854,13 +1079,13 @@ async function loadFiles(folderId) {
 
 function renderBreadcrumb(bc) {
   if (!bc) bc = [{ id: "root", name: "My Drive" }];
-  const viewNames = { files: "My Drive", recent: "Recent", starred: "Starred", images: "Images", videos: "Videos", audio: "Audio", documents: "Documents", telegram: "Telegram Files", messenger: "Chats & Channels", trash: "Trash" };
+  const viewNames = { files: "My Drive", recent: "Recent", starred: "Starred", images: "Images", videos: "Videos", audio: "Audio", documents: "Documents", telegram: "Drive All Files", messenger: "Chats & Channels", trash: "Trash" };
   if (currentView !== "files") {
     el("breadcrumb").innerHTML = `<a href="#" onclick="window.switchView('${currentView}')">${viewNames[currentView] || currentView}</a>`;
     return;
   }
   el("breadcrumb").innerHTML = bc.map((f, i) =>
-    `${i > 0 ? '<span class="sep"><i class="fas fa-chevron-right"></i></span>' : ''}<a href="#" onclick="window.navFolder('${f.id}')">${esc(f.name)}</a>`
+    `${i > 0 ? '<span class="sep"><i class="fas fa-chevron-right"></i></span>' : ''}<a href="#" onclick="window.navFolder('${f.id}')" ondragover="window.handleDragOver(event)" ondragleave="window.handleDragLeave(event)" ondrop="window.handleDrop(event,'${f.id}')">${esc(f.name)}</a>`
   ).join("");
 }
 
@@ -869,7 +1094,7 @@ function renderFolders(folders) {
   g.className = `file-grid ${viewMode === "list" ? "list-view" : ""}`;
   g.innerHTML = folders.map(f => {
     const color = f.color || "#ffab00";
-    return `<div class="file-card${selectedItems.has(f.id) ? ' selected' : ''}" data-id="${f.id}" ondblclick="window.navFolder('${f.id}')" onclick="window.handleCardClick(event,'${f.id}','folder')" oncontextmenu="window.showContext(event,'folder','${f.id}')">
+    return `<div class="file-card folder-card${selectedItems.has(f.id) ? ' selected' : ''}" data-id="${f.id}" draggable="true" ondragstart="window.handleDragStart(event,'${f.id}','folder')" ondragend="window.handleDragEnd(event)" ondblclick="window.navFolder('${f.id}')" onclick="window.handleCardClick(event,'${f.id}','folder')" oncontextmenu="window.showContext(event,'folder','${f.id}')" ondragover="window.handleDragOver(event)" ondragleave="window.handleDragLeave(event)" ondrop="window.handleDrop(event,'${f.id}')">
       <div class="card-checkbox" onclick="event.stopPropagation();window.toggleSelect('${f.id}','folder')"><i class="fas fa-check"></i></div>
       <div class="file-icon folder" style="background:${color}18;color:${color}"><i class="fas fa-folder"></i></div>
       ${viewMode === "list" ? `<div class="file-info"><div class="file-name" title="${esc(f.name)}">${esc(f.name)}</div><div class="file-meta">Folder</div><div class="file-date">${fmtDate(f.createdDate)}</div></div>` : `<div class="file-name" title="${esc(f.name)}">${esc(f.name)}</div><div class="file-meta">Folder</div>`}
@@ -902,7 +1127,7 @@ function renderFiles(files) {
       }, 0);
     }
     
-    return `<div class="file-card${selectedItems.has(f.id) ? ' selected' : ''}" data-id="${f.id}" onclick="window.handleCardClick(event,'${f.id}','file')" ondblclick="window.previewFile('${f.id}')" oncontextmenu="window.showContext(event,'file','${f.id}')">
+    return `<div class="file-card${selectedItems.has(f.id) ? ' selected' : ''}" data-id="${f.id}" draggable="true" ondragstart="window.handleDragStart(event,'${f.id}','file')" ondragend="window.handleDragEnd(event)" onclick="window.handleCardClick(event,'${f.id}','file')" ondblclick="window.previewFile('${f.id}')" oncontextmenu="window.showContext(event,'file','${f.id}')">
       <div class="card-checkbox" onclick="event.stopPropagation();window.toggleSelect('${f.id}','file')"><i class="fas fa-check"></i></div>
       <div class="file-star ${starred}" onclick="event.stopPropagation();window.toggleStar('${f.id}')" title="Star"><i class="fas fa-star"></i></div>
       ${thumbHtml}${iconHtml}
@@ -947,12 +1172,26 @@ function ensureFolderPath(pathParts, baseFolderId) {
 // How many files upload simultaneously. Higher = faster for many small files,
 // but too high risks Telegram FLOOD_WAIT rate limits and high memory usage.
 const MAX_PARALLEL_UPLOADS = 4;
+window.cancelUpload = function(taskId) {
+  if (activeUploadTasks.has(taskId)) {
+    const task = activeUploadTasks.get(taskId);
+    if (task.controller) task.controller.abort();
+    if (task.item && task.item.statusLabel) {
+      task.item.statusLabel.textContent = "Cancelled";
+      task.item.statusLabel.className = "upload-status warning";
+      if (task.item.progressBar) task.item.progressBar.style.background = "var(--warning)";
+    }
+    activeUploadTasks.delete(taskId);
+    toast("Upload cancelled", "info");
+  }
+};
 
 async function uploadEntries(entries) {
   if (!entries?.length) return;
   const list = el("upload-list");
   const panel = el("upload-panel");
   if (panel) {
+    if (el("upload-panel-title")) el("upload-panel-title").innerHTML = `<i class="fas fa-cloud-upload-alt"></i> File Uploads`;
     show("upload-panel");
     panel.classList.remove("minimized");
     const icon = panel.querySelector(".upload-panel-header button i");
@@ -962,17 +1201,24 @@ async function uploadEntries(entries) {
   const baseFolderId = currentFolder;
 
   const items = [];
+  let idx = 0;
   for (const { file: f, relativePath } of entries) {
     const displayName = relativePath || f.name;
+    const taskId = `up_${Date.now()}_${idx++}_${Math.random().toString(36).substr(2, 4)}`;
     const item = document.createElement("div");
     item.className = "upload-item";
-    item.innerHTML = `<div class="upload-item-icon"><i class="${fileIcon(fileTypeFromMime(f.type, f.name))}"></i></div><div class="upload-item-info"><div class="upload-item-name">${esc(displayName)}</div><div class="upload-progress"><div class="upload-progress-bar" style="width:0%"></div></div><div class="upload-status">Preparing...</div></div>`;
+    item.id = `upload-item-${taskId}`;
+    item.innerHTML = `<div class="upload-item-icon"><i class="${fileIcon(fileTypeFromMime(f.type, f.name))}"></i></div>
+    <div class="upload-item-info">
+      <div class="upload-item-name">${esc(displayName)}</div>
+      <div class="upload-progress"><div class="upload-progress-bar" style="width:0%"></div></div>
+      <div class="upload-status">Preparing...</div>
+    </div>
+    <button class="upload-item-dismiss" onclick="window.cancelUpload('${taskId}')" style="background:none; border:none; color:var(--text-3); cursor:pointer; padding:4px;" aria-label="Cancel upload"><i class="fas fa-times"></i></button>`;
     list.appendChild(item);
-    items.push({ file: f, relativePath, progressBar: item.querySelector(".upload-progress-bar"), statusLabel: item.querySelector(".upload-status") });
+    items.push({ taskId, file: f, relativePath, progressBar: item.querySelector(".upload-progress-bar"), statusLabel: item.querySelector(".upload-status") });
   }
 
-  // Worker pool: run up to MAX_PARALLEL_UPLOADS uploads concurrently,
-  // each worker pulling the next pending file until the queue is empty.
   let nextIndex = 0;
   const workers = Array.from({ length: Math.min(MAX_PARALLEL_UPLOADS, items.length) }, async () => {
     while (nextIndex < items.length) {
@@ -989,8 +1235,11 @@ async function uploadEntries(entries) {
 
 async function uploadSingleEntry(item, baseFolderId) {
   const f = item.file;
+  const taskId = item.taskId;
+  const controller = new AbortController();
+  activeUploadTasks.set(taskId, { controller, item });
+
   try {
-    // Recreate the source folder structure and target the deepest folder
     let destFolderId = baseFolderId;
     if (item.relativePath) {
       const parts = item.relativePath.split("/").slice(0, -1);
@@ -998,7 +1247,9 @@ async function uploadSingleEntry(item, baseFolderId) {
     }
 
     item.statusLabel.textContent = "Uploading... 0%";
+    const startTime = Date.now();
     const arrayBuffer = await f.arrayBuffer();
+    if (controller.signal.aborted) return;
     const buffer = Buffer.from(arrayBuffer);
     const customFile = new CustomFile(f.name, f.size, "", buffer);
 
@@ -1007,11 +1258,18 @@ async function uploadSingleEntry(item, baseFolderId) {
       caption: `🗂 TG-Drive | ${item.relativePath || f.name}`,
       forceDocument: true,
       progressCallback: (progress) => {
+        if (controller.signal.aborted) return;
         const pct = Math.round(progress * 100);
+        const bytes = progress * f.size;
+        const elapsed = (Date.now() - startTime) / 1000;
+        const speed = elapsed > 0 ? bytes / elapsed : 0;
+        const eta = speed > 0 ? (f.size - bytes) / speed : 0;
         item.progressBar.style.width = pct + "%";
-        item.statusLabel.textContent = `Uploading... ${pct}%`;
+        item.statusLabel.textContent = `Uploading... ${pct}% • ${fmtBytes(speed)}/s • ${Math.ceil(eta)}s left`;
       }
     });
+
+    if (controller.signal.aborted) return;
 
     const fileEntry = {
       id: Date.now().toString(36) + Math.random().toString(36).substr(2, 9),
@@ -1033,12 +1291,14 @@ async function uploadSingleEntry(item, baseFolderId) {
     item.statusLabel.className = "upload-status success";
     item.progressBar.style.width = "100%";
     item.progressBar.style.background = "var(--success)";
-
-  } catch (e) {
-    console.error(e);
-    item.statusLabel.textContent = "✗ " + e.message;
-    item.statusLabel.className = "upload-status error";
-    toast(`Upload failed for ${f.name}`, "error");
+  } catch (err) {
+    if (controller.signal.aborted) return;
+    console.error("Upload failed:", err);
+    item.statusLabel.textContent = "✕ Failed";
+    item.statusLabel.className = "upload-status danger";
+    item.progressBar.style.background = "var(--danger)";
+  } finally {
+    activeUploadTasks.delete(taskId);
   }
 }
 
@@ -1525,8 +1785,9 @@ async function downloadFolder(id) {
   const files = fileDatabase.files.filter(f => !f.trashed && subIds.includes(f.folderId));
   if (!files.length) return toast("Folder is empty", "warning");
 
-  // Show progress in the upload panel
+  // Show progress in the transfer panel
   const list = el("upload-list");
+  if (el("upload-panel-title")) el("upload-panel-title").innerHTML = `<i class="fas fa-cloud-download-alt"></i> Folder Downloads`;
   show("upload-panel");
   const item = document.createElement("div");
   item.className = "upload-item";
@@ -1673,18 +1934,69 @@ function getLanguage(ext) {
   return map[ext] || "plaintext";
 }
 
+function copyShareLink(id) {
+  const file = fileDatabase.files.find(f => f.id === id);
+  if (!file) return toast("Share link unavailable for this item", "warning");
+  const link = `${window.location.origin}${window.location.pathname}?file=${encodeURIComponent(file.id)}`;
+  navigator.clipboard.writeText(link).then(() => {
+    toast("Drive web share link copied to clipboard!", "success");
+  }).catch(() => {
+    toast("Link: " + link, "info");
+  });
+  hideContext();
+}
+
+function copyTelegramMessageLink(id) {
+  const file = fileDatabase.files.find(f => f.id === id);
+  if (!file || !file.messageId) return toast("Telegram message link unavailable for this item", "warning");
+  let link = "";
+  if (targetPeer && typeof targetPeer === "string" && targetPeer.startsWith("-100")) {
+    const channelId = targetPeer.replace("-100", "");
+    link = `https://t.me/c/${channelId}/${file.messageId}`;
+  } else if (targetPeer && typeof targetPeer === "string" && targetPeer !== "me") {
+    const cleanPeer = targetPeer.replace("@", "");
+    link = `https://t.me/${cleanPeer}/${file.messageId}`;
+  } else {
+    link = `https://t.me/c/0/${file.messageId}`;
+  }
+  navigator.clipboard.writeText(link).then(() => {
+    toast("Telegram message link copied to clipboard!", "success");
+  }).catch(() => {
+    toast("Link: " + link, "info");
+  });
+  hideContext();
+}
+
+function shareToTelegram(id) {
+  const file = fileDatabase.files.find(f => f.id === id);
+  if (!file) return toast("Share link unavailable", "warning");
+  const webLink = `${window.location.origin}${window.location.pathname}?file=${encodeURIComponent(file.id)}`;
+  const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(webLink)}&text=${encodeURIComponent('Download ' + file.name + ' via Telegram Drive')}`;
+  window.open(shareUrl, "_blank");
+  hideContext();
+}
+
 // ==================== CONTEXT MENU ====================
 function showContext(e, type, id) {
   e.preventDefault(); e.stopPropagation();
   const menu = el("context-menu");
   let html = "";
 
+  if (selectedItems.size > 1 && selectedItems.has(id)) {
+    html += `<button class="ctx-item" onclick="window.bulkDownloadQueue()"><i class="fas fa-layer-group"></i>Download Selected (${selectedItems.size} Queue)</button>
+            <div class="ctx-divider"></div>`;
+  }
+
   if (currentView === "trash") {
-    html = `<button class="ctx-item" onclick="window.restoreFile('${id}')"><i class="fas fa-undo"></i>Restore</button>
+    html += `<button class="ctx-item" onclick="window.restoreFile('${id}')"><i class="fas fa-undo"></i>Restore</button>
             <button class="ctx-item danger" onclick="window.permDelete('${id}')"><i class="fas fa-trash"></i>Delete Forever</button>`;
   } else if (type === "file") {
-    html = `<button class="ctx-item" onclick="window.previewFile('${id}')"><i class="fas fa-eye"></i>Preview</button>
+    html += `<button class="ctx-item" onclick="window.previewFile('${id}')"><i class="fas fa-eye"></i>Preview</button>
             <button class="ctx-item" onclick="window.downloadFile('${id}','')"><i class="fas fa-download"></i>Download</button>
+            <div class="ctx-divider"></div>
+            <button class="ctx-item" onclick="window.copyShareLink('${id}')"><i class="fas fa-link"></i>Copy Drive Link</button>
+            <button class="ctx-item" onclick="window.copyTelegramMessageLink('${id}')"><i class="fab fa-telegram"></i>Copy TG Message Link</button>
+            <button class="ctx-item" onclick="window.shareToTelegram('${id}')"><i class="fas fa-share-alt"></i>Share to Chat</button>
             <div class="ctx-divider"></div>
             <button class="ctx-item" onclick="window.showRename('file','${id}')"><i class="fas fa-edit"></i>Rename<span class="shortcut">F2</span></button>
             <button class="ctx-item" onclick="window.showMoveModal(['${id}'],'file')"><i class="fas fa-arrows-alt"></i>Move to</button>
@@ -1694,7 +2006,7 @@ function showContext(e, type, id) {
             <button class="ctx-item" onclick="window.showInfo('${id}')"><i class="fas fa-info-circle"></i>Details</button>
             <button class="ctx-item danger" onclick="window.trashFile('${id}')"><i class="fas fa-trash"></i>Move to Trash<span class="shortcut">Del</span></button>`;
   } else if (type === "folder") {
-    html = `<button class="ctx-item" onclick="window.navFolder('${id}')"><i class="fas fa-folder-open"></i>Open</button>
+    html += `<button class="ctx-item" onclick="window.navFolder('${id}')"><i class="fas fa-folder-open"></i>Open</button>
             <button class="ctx-item" onclick="window.downloadFolder('${id}')"><i class="fas fa-file-archive"></i>Download as ZIP</button>
             <div class="ctx-divider"></div>
             <button class="ctx-item" onclick="window.showRename('folder','${id}')"><i class="fas fa-edit"></i>Rename</button>
@@ -1752,6 +2064,7 @@ function updateSelectionUI() {
   if (selectedItems.size > 0) {
     show("selection-bar");
     el("selection-count").textContent = selectedItems.size;
+    show("sel-btn-download");
     show("sel-btn-move");
     show("sel-btn-star");
     show("sel-btn-trash");
@@ -1771,6 +2084,7 @@ function updateTelegramSelectionUI() {
   if (selectedItems.size > 0) {
     show("selection-bar");
     el("selection-count").textContent = selectedItems.size;
+    show("sel-btn-download");
     hide("sel-btn-move");
     hide("sel-btn-star");
     hide("sel-btn-trash");
@@ -1865,6 +2179,112 @@ async function bulkAction(action) {
   toast(`Items updated`, "success");
   clearSelection();
   loadFiles();
+}
+
+async function bulkDownloadQueue() {
+  const ids = [...selectedItems];
+  if (!ids.length) return toast("No items selected to download", "warning");
+
+  const filesToDownload = [];
+  const fileIdSet = new Set();
+
+  function addFile(f) {
+    if (f && !f.trashed && !fileIdSet.has(f.id)) {
+      fileIdSet.add(f.id);
+      filesToDownload.push(f);
+    }
+  }
+
+  for (const id of ids) {
+    const file = fileDatabase.files.find(f => f.id === id);
+    if (file) {
+      addFile(file);
+    } else {
+      const folder = fileDatabase.folders.find(fo => fo.id === id);
+      if (folder) {
+        const subFolderIds = getAllSubFolderIds(id);
+        const folderFiles = fileDatabase.files.filter(f => !f.trashed && subFolderIds.includes(f.folderId));
+        folderFiles.forEach(addFile);
+      }
+    }
+  }
+
+  if (!filesToDownload.length) {
+    return toast("No downloadable files found in selection", "warning");
+  }
+
+  toast(`Starting queue download of ${filesToDownload.length} file${filesToDownload.length !== 1 ? 's' : ''}...`, "info");
+  
+  // Show progress in the transfer panel
+  const list = el("upload-list");
+  if (el("upload-panel-title")) el("upload-panel-title").innerHTML = `<i class="fas fa-cloud-download-alt"></i> Queue Downloads`;
+  show("upload-panel");
+  const item = document.createElement("div");
+  item.className = "upload-item";
+  item.innerHTML = `
+    <div class="upload-item-icon"><i class="fas fa-layer-group" style="color:var(--primary);"></i></div>
+    <div class="upload-item-info">
+      <div class="upload-item-name">Queue Download (${filesToDownload.length} file${filesToDownload.length !== 1 ? 's' : ''})</div>
+      <div class="upload-progress"><div class="upload-progress-bar" style="width:0%"></div></div>
+      <div class="upload-status">Starting queue...</div>
+    </div>
+    <button class="btn-icon btn-cancel-queue" title="Cancel Queue" style="padding:4px; margin-left:8px; width:28px; height:28px; border-radius:50%;"><i class="fas fa-times" style="font-size:12px;"></i></button>
+  `;
+  list.appendChild(item);
+
+  const progressBar = item.querySelector(".upload-progress-bar");
+  const statusLabel = item.querySelector(".upload-status");
+  const cancelBtn = item.querySelector(".btn-cancel-queue");
+
+  let isCancelled = false;
+  cancelBtn.addEventListener("click", () => {
+    isCancelled = true;
+    statusLabel.textContent = "Queue download cancelled";
+    toast("Download queue cancelled", "warning");
+    cancelBtn.remove();
+  });
+
+  let completedCount = 0;
+  let failedCount = 0;
+
+  for (let i = 0; i < filesToDownload.length; i++) {
+    if (isCancelled) break;
+    const file = filesToDownload[i];
+    statusLabel.textContent = `Downloading ${i + 1}/${filesToDownload.length}: ${file.name}`;
+    progressBar.style.width = Math.round((i / filesToDownload.length) * 100) + "%";
+
+    try {
+      const url = await getFileObjectUrl(file.id, false);
+      if (url) {
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = file.name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        completedCount++;
+      } else {
+        failedCount++;
+      }
+    } catch (err) {
+      console.error(`Error downloading ${file.name} in queue:`, err);
+      failedCount++;
+    }
+
+    // Brief delay between file downloads for clean browser queueing
+    await new Promise(res => setTimeout(res, 400));
+  }
+
+  progressBar.style.width = "100%";
+  if (isCancelled) {
+    statusLabel.textContent = `Queue cancelled (${completedCount}/${filesToDownload.length} downloaded)`;
+  } else {
+    statusLabel.textContent = `Completed ${completedCount}/${filesToDownload.length} files` + (failedCount > 0 ? ` (${failedCount} failed)` : '');
+    toast(`Queue download complete! ${completedCount} file${completedCount !== 1 ? 's' : ''} downloaded.`, "success");
+    clearSelection();
+  }
+
+  if (cancelBtn.parentNode) cancelBtn.remove();
 }
 
 // ==================== FILE OPERATIONS ====================
@@ -2235,18 +2655,41 @@ async function doMove() {
 // ==================== SEARCH & FILTER ====================
 function handleSearch(q) {
   clearTimeout(searchTimeout);
-  el("search-clear").classList.toggle("hidden", !q);
+  const clearBtn = el("search-clear");
+  if (clearBtn) clearBtn.classList.toggle("hidden", !q);
+
+  if (currentView === "messenger") {
+    if (window.msgHandleDialogSearch) {
+      window.msgHandleDialogSearch(q);
+    }
+    return;
+  }
+
   searchTimeout = setTimeout(() => {
     loadFiles();
   }, 300);
 }
 
-function clearSearch() { el("search-input").value = ""; el("search-clear").classList.add("hidden"); loadFiles(); }
+function clearSearch() {
+  const searchInput = el("search-input");
+  if (searchInput) searchInput.value = "";
+  const clearBtn = el("search-clear");
+  if (clearBtn) clearBtn.classList.add("hidden");
+
+  if (currentView === "messenger") {
+    if (window.msgClearSearch) window.msgClearSearch();
+  } else {
+    loadFiles();
+  }
+}
 
 function handleSort(val) {
   const [s, o] = val.split("-"); sortBy = s; sortOrder = o;
   loadFiles();
 }
+
+let activeStorageCat = "all";
+let activeStorageMinSize = 0;
 
 function switchView(view, pushHistory = true) {
   if (window.event && window.event.preventDefault) {
@@ -2276,18 +2719,196 @@ function switchView(view, pushHistory = true) {
     if (el("view-toggle")) el("view-toggle").style.display = "none";
     if (el("topbar-new-folder")) el("topbar-new-folder").style.display = "none";
     el("breadcrumb").innerHTML = `<a href="#" onclick="window.switchView('messenger')">Chats & Channels</a>`;
+    
+    const searchInput = el("search-input");
+    if (searchInput) {
+      searchInput.placeholder = "Search chats, files or paste Telegram link...";
+      if (searchInput.value.trim() && window.msgHandleDialogSearch) {
+        window.msgHandleDialogSearch(searchInput.value.trim());
+      }
+    }
+
     if (window.openMessenger) window.openMessenger();
+    return;
+  }
+  if (view === "analytics") {
+    if (el("sort-select")) el("sort-select").style.display = "none";
+    if (el("view-toggle")) el("view-toggle").style.display = "none";
+    if (el("topbar-new-folder")) el("topbar-new-folder").style.display = "none";
+    el("breadcrumb").innerHTML = `<a href="#" onclick="window.switchView('analytics')">Storage Analytics</a>`;
+    renderStorageAnalyticsDetail();
     return;
   }
   // Restore drive top bar elements when switching back
   if (el("sort-select")) el("sort-select").style.display = "";
   if (el("view-toggle")) el("view-toggle").style.display = "";
+  if (el("topbar-new-folder")) el("topbar-new-folder").style.display = "";
+  const searchInput = el("search-input");
+  if (searchInput) {
+    searchInput.placeholder = "Search files...";
+  }
+
   if (view === "telegram") {
     loadTelegramView(true);
   } else {
     if (view === "files") currentFolder = currentFolder || "root";
     loadFiles();
   }
+}
+
+function renderStorageAnalyticsDetail(filterCat = activeStorageCat, filterMinSize = activeStorageMinSize) {
+  activeStorageCat = filterCat;
+  activeStorageMinSize = filterMinSize;
+  clearSelection();
+
+  const files = fileDatabase.files.filter(f => !f.trashed);
+  const totalBytes = files.reduce((acc, f) => acc + (f.size || 0), 0);
+  const totalCount = files.length;
+  const totalFolders = Math.max(0, fileDatabase.folders.length - 1);
+  const avgSize = totalCount > 0 ? Math.round(totalBytes / totalCount) : 0;
+
+  const catMap = {
+    all: { name: "All Files", color: "var(--primary)", bytes: totalBytes, count: totalCount, icon: "fa-hard-drive" },
+    image: { name: "Images", color: "#0088cc", bytes: 0, count: 0, icon: "fa-image" },
+    video: { name: "Videos", color: "#e91e63", bytes: 0, count: 0, icon: "fa-video" },
+    audio: { name: "Audio", color: "#9c27b0", bytes: 0, count: 0, icon: "fa-music" },
+    document: { name: "Documents", color: "#ffab00", bytes: 0, count: 0, icon: "fa-file-alt" },
+    pdf: { name: "PDFs", color: "#fb4d6d", bytes: 0, count: 0, icon: "fa-file-pdf" },
+    archive: { name: "Archives", color: "#00d68f", bytes: 0, count: 0, icon: "fa-file-archive" },
+    other: { name: "Other", color: "#607d8b", bytes: 0, count: 0, icon: "fa-file" }
+  };
+
+  for (const f of files) {
+    const type = f.type || fileTypeFromMime(f.mimeType, f.name);
+    const key = catMap[type] ? type : "other";
+    catMap[key].bytes += (f.size || 0);
+    catMap[key].count += 1;
+  }
+
+  let displayFiles = files.filter(f => {
+    const type = f.type || fileTypeFromMime(f.mimeType, f.name);
+    const cat = catMap[type] ? type : "other";
+    const matchesCat = filterCat === "all" || cat === filterCat;
+    const matchesSize = (f.size || 0) >= filterMinSize;
+    return matchesCat && matchesSize;
+  });
+
+  displayFiles.sort((a, b) => (b.size || 0) - (a.size || 0));
+
+  hide("folders-section");
+  hide("trash-bar");
+  hide("empty-state");
+  show("files-section");
+
+  const grid = el("files-grid");
+  grid.className = "storage-detail-container";
+  el("file-count").textContent = `${displayFiles.length} file${displayFiles.length !== 1 ? 's' : ''}`;
+
+  const segmentHtml = Object.entries(catMap)
+    .filter(([k]) => k !== "all")
+    .map(([k, c]) => {
+      const pct = totalBytes > 0 ? (c.bytes / totalBytes) * 100 : 0;
+      return pct > 0 ? `<div class="storage-segment" style="width:${pct}%; background:${c.color};" title="${c.name}: ${fmtBytes(c.bytes)} (${Math.round(pct)}%)"></div>` : "";
+    }).join("");
+
+  const chipsHtml = Object.entries(catMap).map(([k, c]) => {
+    const active = filterCat === k ? "active" : "";
+    return `
+      <div class="storage-cat-chip ${active}" onclick="window.renderStorageAnalyticsDetail('${k}', ${filterMinSize})">
+        <span><i class="fas ${c.icon}" style="color:${c.color}; margin-right:8px;"></i>${c.name} (${c.count})</span>
+        <span style="font-weight:600; color:var(--text-2);">${fmtBytes(c.bytes)}</span>
+      </div>`;
+  }).join("");
+
+  const tableRows = displayFiles.map(f => {
+    const folder = fileDatabase.folders.find(fold => fold.id === f.folderId);
+    const folderName = folder ? folder.name : "My Drive";
+    return `
+      <tr>
+        <td style="font-weight:600;">
+          <i class="fas ${fileIcon(f.type)}" style="color:var(--primary); margin-right:8px;"></i>
+          ${esc(f.name)}
+        </td>
+        <td><span style="padding:2px 8px; border-radius:12px; background:var(--bg-4); font-size:11px; text-transform:uppercase;">${f.type}</span></td>
+        <td style="font-weight:700; color:var(--primary-light);">${fmtBytes(f.size)}</td>
+        <td>${fmtDate(f.uploadDate)}</td>
+        <td><i class="fas fa-folder" style="color:var(--warning); margin-right:6px;"></i>${esc(folderName)}</td>
+        <td style="text-align:right;">
+          <button class="btn btn-ghost" style="padding:4px 8px;" onclick="window.previewFile('${f.id}')" title="Preview"><i class="fas fa-eye"></i></button>
+          <button class="btn btn-ghost" style="padding:4px 8px;" onclick="window.downloadFile('${f.id}')" title="Download"><i class="fas fa-download"></i></button>
+          <button class="btn btn-ghost danger" style="padding:4px 8px;" onclick="window.trashFile('${f.id}')" title="Move to Trash"><i class="fas fa-trash"></i></button>
+        </td>
+      </tr>`;
+  }).join("");
+
+  grid.innerHTML = `
+    <div class="storage-metrics-grid">
+      <div class="metric-card">
+        <div class="metric-card-title"><i class="fas fa-hard-drive" style="color:var(--primary);"></i> Storage Used</div>
+        <div class="metric-card-value">${fmtBytes(totalBytes)}</div>
+        <div class="metric-card-sub">Unlimited cloud storage active</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-card-title"><i class="fas fa-file" style="color:#22d3ee;"></i> Total Files</div>
+        <div class="metric-card-value">${totalCount}</div>
+        <div class="metric-card-sub">Files saved across all folders</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-card-title"><i class="fas fa-folder" style="color:var(--warning);"></i> Total Folders</div>
+        <div class="metric-card-value">${totalFolders}</div>
+        <div class="metric-card-sub">Custom directory structure</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-card-title"><i class="fas fa-calculator" style="color:#8b5cf6;"></i> Average File Size</div>
+        <div class="metric-card-value">${fmtBytes(avgSize)}</div>
+        <div class="metric-card-sub">Mean file size stored</div>
+      </div>
+    </div>
+
+    <div class="storage-segment-container">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <h4 style="font-size:14px; font-weight:700; color:var(--text-1); margin:0;">Category Distribution</h4>
+        <span style="font-size:12px; color:var(--text-3);">${totalCount} items stored</span>
+      </div>
+      <div class="storage-segment-bar">
+        ${segmentHtml}
+      </div>
+      <div class="storage-categories-grid">
+        ${chipsHtml}
+      </div>
+    </div>
+
+    <div class="storage-filter-bar">
+      <div style="font-weight:600; font-size:13px; color:var(--text-1); display:flex; align-items:center; gap:8px;">
+        <i class="fas fa-filter" style="color:var(--primary);"></i>
+        Filter by Size:
+      </div>
+      <div class="storage-pill-group">
+        <button class="storage-pill ${filterMinSize === 0 ? 'active' : ''}" onclick="window.renderStorageAnalyticsDetail('${filterCat}', 0)">All Sizes</button>
+        <button class="storage-pill ${filterMinSize === 10485760 ? 'active' : ''}" onclick="window.renderStorageAnalyticsDetail('${filterCat}', 10485760)">> 10 MB</button>
+        <button class="storage-pill ${filterMinSize === 104857600 ? 'active' : ''}" onclick="window.renderStorageAnalyticsDetail('${filterCat}', 104857600)">> 100 MB</button>
+        <button class="storage-pill ${filterMinSize === 524288000 ? 'active' : ''}" onclick="window.renderStorageAnalyticsDetail('${filterCat}', 524288000)">> 500 MB</button>
+        <button class="storage-pill ${filterMinSize === 1073741824 ? 'active' : ''}" onclick="window.renderStorageAnalyticsDetail('${filterCat}', 1073741824)">> 1 GB</button>
+      </div>
+    </div>
+
+    <div style="overflow-x:auto;">
+      <table class="storage-files-table">
+        <thead>
+          <tr>
+            <th>File Name</th>
+            <th>Type</th>
+            <th>Size</th>
+            <th>Upload Date</th>
+            <th>Location</th>
+            <th style="text-align:right;">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${tableRows || `<tr><td colspan="6" style="text-align:center; padding:32px; color:var(--text-3);">No matching files found in storage</td></tr>`}
+        </tbody>
+      </table>
+    </div>`;
 }
 
 function updateNav(view) {
@@ -2671,19 +3292,61 @@ function refreshFiles() {
 // ==================== DRAG & DROP ====================
 function setupDragDrop() {
   const dz = el("drop-zone");
-  document.addEventListener("dragenter", e => { e.preventDefault(); dragCounter++; dz.classList.add("active"); });
-  document.addEventListener("dragleave", e => { e.preventDefault(); dragCounter--; if (!dragCounter) dz.classList.remove("active"); });
-  document.addEventListener("dragover", e => e.preventDefault());
-  document.addEventListener("drop", async e => {
-    e.preventDefault(); dragCounter = 0; dz.classList.remove("active");
+
+  document.addEventListener("dragstart", () => {
+    isDraggingInternal = true;
+  });
+
+  document.addEventListener("dragend", () => {
+    isDraggingInternal = false;
+    dragCounter = 0;
+    if (dz) dz.classList.remove("active");
+  });
+
+  document.addEventListener("dragenter", e => {
+    e.preventDefault();
+    if (isDraggingInternal) return;
+
     const dt = e.dataTransfer;
-    if (dt.items?.length && typeof dt.items[0].webkitGetAsEntry === "function") {
+    if (dt && dt.types) {
+      const types = Array.from(dt.types);
+      if (!types.includes("Files")) return;
+    }
+
+    dragCounter++;
+    if (dz) dz.classList.add("active");
+  });
+
+  document.addEventListener("dragleave", e => {
+    e.preventDefault();
+    if (isDraggingInternal) return;
+    dragCounter--;
+    if (dragCounter <= 0) {
+      dragCounter = 0;
+      if (dz) dz.classList.remove("active");
+    }
+  });
+
+  document.addEventListener("dragover", e => e.preventDefault());
+
+  document.addEventListener("drop", async e => {
+    e.preventDefault();
+    dragCounter = 0;
+    if (dz) dz.classList.remove("active");
+
+    if (isDraggingInternal) {
+      isDraggingInternal = false;
+      return;
+    }
+
+    const dt = e.dataTransfer;
+    if (dt?.items?.length && typeof dt.items[0].webkitGetAsEntry === "function") {
       // Grab entries synchronously — dataTransfer items become invalid after an await
       const roots = [...dt.items].map(i => i.webkitGetAsEntry()).filter(Boolean);
       const collected = [];
       for (const entry of roots) await collectDroppedEntries(entry, "", collected);
       if (collected.length) uploadEntries(collected);
-    } else if (dt.files.length) {
+    } else if (dt?.files?.length) {
       uploadEntries([...dt.files].map(f => ({ file: f, relativePath: "" })));
     }
   });
@@ -2712,13 +3375,77 @@ function collectDroppedEntries(entry, basePath, out) {
 function setupKeys() {
   document.addEventListener("keydown", e => {
     const tag = e.target.tagName;
-    const isInput = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+    const isInput = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || e.target.isContentEditable;
 
     if (e.key === "Escape") {
-      closePreview(); closeModal("folder-modal"); closeModal("rename-modal"); closeModal("move-modal"); closeModal("info-modal"); closeModal("shortcuts-modal"); cancelConfirm(); hideContext(); clearSelection();
+      closePreview();
+      closeModal("folder-modal");
+      closeModal("rename-modal");
+      closeModal("move-modal");
+      closeModal("info-modal");
+      closeModal("shortcuts-modal");
+      closeModal("storage-analytics-modal");
+      cancelConfirm();
+      hideContext();
+      clearSelection();
+      document.querySelectorAll(".modal:not(.hidden)").forEach(m => m.classList.add("hidden"));
+      if (el("help-drawer")) {
+        el("help-drawer").classList.remove("open");
+        document.body.classList.remove("drawer-open");
+      }
+      if (document.activeElement && (document.activeElement.tagName === "INPUT" || document.activeElement.tagName === "TEXTAREA")) {
+        document.activeElement.blur();
+      }
+    }
+
+    if (e.target && e.target.id === "search-input" && e.key === "Enter") {
+      if (currentView === "messenger") {
+        e.preventDefault();
+        const query = e.target.value.trim();
+        if (query && window.msgExecuteSearch) {
+          window.msgExecuteSearch(query);
+        }
+      }
     }
 
     if (isInput) return;
+
+    // Backspace: Go to previous state (switchView / history)
+    if (e.key === "Backspace") {
+      e.preventDefault();
+      if (previewFileId || (el("preview-modal") && !el("preview-modal").classList.contains("hidden"))) {
+        closePreview();
+      } else if (document.querySelector(".modal:not(.hidden)")) {
+        document.querySelectorAll(".modal:not(.hidden)").forEach(m => m.classList.add("hidden"));
+      } else if (window.history && window.history.state) {
+        window.history.back();
+      } else if (currentFolder && currentFolder !== "root") {
+        navFolder("root");
+      } else if (currentView && currentView !== "files") {
+        switchView("files");
+      } else {
+        window.history.back();
+      }
+    }
+
+    // Tab: Switch sidebars / views
+    if (e.key === "Tab") {
+      e.preventDefault();
+      const sidebarNavItems = Array.from(document.querySelectorAll(".sidebar-nav .nav-item")).filter(item => {
+        const style = window.getComputedStyle(item);
+        return style.display !== "none" && style.visibility !== "hidden";
+      });
+      if (sidebarNavItems.length > 0) {
+        let currentIndex = sidebarNavItems.findIndex(item => item.getAttribute("data-view") === currentView || item.classList.contains("active"));
+        if (currentIndex === -1) currentIndex = 0;
+        const dir = e.shiftKey ? -1 : 1;
+        const nextIndex = (currentIndex + dir + sidebarNavItems.length) % sidebarNavItems.length;
+        const targetView = sidebarNavItems[nextIndex].getAttribute("data-view");
+        if (targetView) {
+          switchView(targetView);
+        }
+      }
+    }
 
     if ((e.ctrlKey || e.metaKey) && e.key === "u") { e.preventDefault(); el("file-upload").click(); }
     if ((e.ctrlKey || e.metaKey) && e.key === "f") { e.preventDefault(); el("search-input").focus(); }
@@ -2728,11 +3455,231 @@ function setupKeys() {
     if (el("preview-modal") && !el("preview-modal").classList.contains("hidden")) {
       if (e.key === "ArrowRight") previewNav(1);
       if (e.key === "ArrowLeft") previewNav(-1);
+      return;
+    }
+
+    // Grid Keyboard Navigation
+    const cards = Array.from(document.querySelectorAll(".file-card"));
+    if (cards.length > 0) {
+      if (["ArrowRight", "ArrowLeft", "ArrowDown", "ArrowUp"].includes(e.key)) {
+        e.preventDefault();
+        const cols = viewMode === "list" ? 1 : Math.max(1, Math.floor((el("files-grid")?.offsetWidth || 800) / 180));
+        if (focusedGridIndex === -1) {
+          focusedGridIndex = 0;
+        } else if (e.key === "ArrowRight") {
+          focusedGridIndex = Math.min(cards.length - 1, focusedGridIndex + 1);
+        } else if (e.key === "ArrowLeft") {
+          focusedGridIndex = Math.max(0, focusedGridIndex - 1);
+        } else if (e.key === "ArrowDown") {
+          focusedGridIndex = Math.min(cards.length - 1, focusedGridIndex + cols);
+        } else if (e.key === "ArrowUp") {
+          focusedGridIndex = Math.max(0, focusedGridIndex - cols);
+        }
+
+        cards.forEach((c, idx) => c.classList.toggle("focused", idx === focusedGridIndex));
+        if (cards[focusedGridIndex]) {
+          cards[focusedGridIndex].scrollIntoView({ block: "nearest", behavior: "smooth" });
+        }
+      } else if (e.key === "Enter" && focusedGridIndex >= 0 && cards[focusedGridIndex]) {
+        cards[focusedGridIndex].dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+      } else if (e.key === " " && focusedGridIndex >= 0 && cards[focusedGridIndex]) {
+        e.preventDefault();
+        cards[focusedGridIndex].dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      }
     }
   });
 }
 
 // ==================== UTILS ====================
+function initTheme() {
+  const savedTheme = localStorage.getItem("tgDriveTheme");
+  let theme = savedTheme;
+  if (!theme && window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) {
+    theme = "light";
+  }
+  if (!theme) theme = "dark";
+  document.documentElement.setAttribute("data-theme", theme);
+  updateThemeIcon(theme);
+}
+
+function toggleTheme() {
+  const currentTheme = document.documentElement.getAttribute("data-theme");
+  const newTheme = currentTheme === "light" ? "dark" : "light";
+  document.documentElement.setAttribute("data-theme", newTheme);
+  localStorage.setItem("tgDriveTheme", newTheme);
+  updateThemeIcon(newTheme);
+  toast(`Switched to ${newTheme} theme`, "info");
+}
+
+function updateThemeIcon(theme) {
+  const btn = document.querySelector("button[onclick*='toggleTheme'] i");
+  if (btn) {
+    btn.className = theme === "light" ? "fas fa-sun" : "fas fa-moon";
+  }
+}
+
+function startTour(force = false) {
+  if (!force && localStorage.getItem("tg_drive_tour_seen")) return;
+  const container = el("tour-container");
+  if (!container) return;
+
+  const rawSteps = [
+    {
+      target: "#btn-upload-new",
+      fallback: "#sidebar",
+      title: "Upload & Create Folders",
+      body: "Click here to upload files, upload entire folders, or build customized folder structures in your drive."
+    },
+    {
+      target: "#content-area",
+      fallback: "#app-screen",
+      title: "Your Drive Workspace",
+      body: "Manage your files here! View items, double-click to open folders/files, right-click for quick options, or drag & drop files directly onto the workspace."
+    },
+    {
+      target: "#search-input",
+      fallback: ".top-bar-right",
+      title: "Instant Search & View Controls",
+      body: "Quickly search through all your uploaded files, toggle view layout (Grid / List), sort files, or switch light/dark themes."
+    },
+    {
+      target: "#nav-messenger",
+      fallback: ".storage-info",
+      title: "Telegram Chats & Storage",
+      body: "Access your Telegram chats and channels directly, stream media, and check your unlimited serverless storage analytics."
+    }
+  ];
+
+  let currentHighlightEl = null;
+
+  function cleanupHighlight() {
+    if (currentHighlightEl) {
+      currentHighlightEl.classList.remove("tour-highlight");
+      currentHighlightEl = null;
+    }
+    document.querySelectorAll(".tour-highlight").forEach(el => el.classList.remove("tour-highlight"));
+  }
+
+  function renderStep(idx) {
+    cleanupHighlight();
+
+    if (idx < 0) idx = 0;
+    if (idx >= rawSteps.length) {
+      container.innerHTML = "";
+      localStorage.setItem("tg_drive_tour_seen", "true");
+      toast("Tour completed! Enjoy Telegram Drive.", "success");
+      return;
+    }
+
+    const s = rawSteps[idx];
+    let targetEl = document.querySelector(s.target);
+
+    // Fallback if target is missing or hidden (e.g. #nav-messenger display:none in bot mode)
+    if (!targetEl || targetEl.offsetWidth === 0 || targetEl.offsetHeight === 0) {
+      targetEl = document.querySelector(s.fallback);
+    }
+
+    if (targetEl && targetEl.offsetWidth > 0 && targetEl.offsetHeight > 0) {
+      targetEl.classList.add("tour-highlight");
+      currentHighlightEl = targetEl;
+      try {
+        targetEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      } catch (e) {}
+    }
+
+    const rect = (targetEl && targetEl.offsetWidth > 0) 
+      ? targetEl.getBoundingClientRect() 
+      : { top: 120, left: 120, bottom: 170, right: 320, width: 200, height: 50 };
+
+    const popoverWidth = 320;
+    const popoverHeight = 220;
+
+    let top = rect.bottom + 14;
+    if (top + popoverHeight > window.innerHeight - 20) {
+      top = Math.max(10, rect.top - popoverHeight - 14);
+    }
+    let left = Math.max(12, Math.min(window.innerWidth - popoverWidth - 20, rect.left));
+
+    container.innerHTML = `
+      <div class="tour-backdrop" onclick="window.dismissTour()"></div>
+      <div class="tour-popover" style="top:${top}px; left:${left}px;">
+        <div class="tour-title"><i class="fas fa-magic"></i> ${s.title}</div>
+        <div class="tour-body">${s.body}</div>
+        <div class="tour-footer">
+          <span class="tour-steps">Step ${idx + 1} of ${rawSteps.length}</span>
+          <div class="tour-btns">
+            ${idx > 0 ? `<button class="btn btn-ghost" style="padding:4px 10px; font-size:12px;" onclick="window.prevTourStep(${idx - 1})"><i class="fas fa-chevron-left"></i> Prev</button>` : ''}
+            <button class="btn btn-ghost" style="padding:4px 10px; font-size:12px;" onclick="window.dismissTour()">Skip</button>
+            <button class="btn btn-primary" style="padding:4px 12px; font-size:12px;" onclick="window.nextTourStep(${idx + 1})">${idx === rawSteps.length - 1 ? 'Finish' : 'Next <i class="fas fa-chevron-right"></i>'}</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  window.nextTourStep = (n) => renderStep(n);
+  window.prevTourStep = (n) => renderStep(n);
+  window.dismissTour = () => {
+    cleanupHighlight();
+    container.innerHTML = "";
+    localStorage.setItem("tg_drive_tour_seen", "true");
+  };
+
+  setTimeout(() => renderStep(0), 600);
+}
+
+function checkOnboardingTour() {
+  startTour(false);
+}
+
+function showStorageAnalytics() {
+  const files = fileDatabase.files.filter(f => !f.trashed);
+  const totalBytes = files.reduce((acc, f) => acc + (f.size || 0), 0);
+  
+  if (el("analytics-total-size")) el("analytics-total-size").textContent = fmtBytes(totalBytes);
+  if (el("analytics-total-count")) el("analytics-total-count").textContent = `${files.length} File${files.length !== 1 ? 's' : ''} stored`;
+
+  const catMap = {
+    image: { name: "Images", color: "#0088cc", bytes: 0, count: 0, icon: "fa-image" },
+    video: { name: "Videos", color: "#e91e63", bytes: 0, count: 0, icon: "fa-video" },
+    audio: { name: "Audio", color: "#9c27b0", bytes: 0, count: 0, icon: "fa-music" },
+    document: { name: "Documents", color: "#ffab00", bytes: 0, count: 0, icon: "fa-file-alt" },
+    pdf: { name: "PDFs", color: "#fb4d6d", bytes: 0, count: 0, icon: "fa-file-pdf" },
+    archive: { name: "Archives", color: "#00d68f", bytes: 0, count: 0, icon: "fa-file-archive" },
+    other: { name: "Other", color: "#607d8b", bytes: 0, count: 0, icon: "fa-file" }
+  };
+
+  for (const f of files) {
+    const type = f.type || fileTypeFromMime(f.mimeType, f.name);
+    const key = catMap[type] ? type : "other";
+    catMap[key].bytes += (f.size || 0);
+    catMap[key].count += 1;
+  }
+
+  const catHtml = Object.values(catMap).map(c => {
+    const pct = totalBytes > 0 ? Math.round((c.bytes / totalBytes) * 100) : 0;
+    return `
+      <div>
+        <div style="display:flex; justify-content:space-between; font-size:12.5px; margin-bottom:4px; color:var(--text-1);">
+          <span><i class="fas ${c.icon}" style="color:${c.color}; margin-right:6px;"></i>${c.name} (${c.count})</span>
+          <span>${fmtBytes(c.bytes)} (${pct}%)</span>
+        </div>
+        <div style="height:6px; background:var(--bg-4); border-radius:4px; overflow:hidden;">
+          <div style="width:${pct}%; height:100%; background:${c.color}; border-radius:4px;"></div>
+        </div>
+      </div>`;
+  }).join("");
+  if (el("analytics-categories")) el("analytics-categories").innerHTML = catHtml;
+
+  const largest = [...files].sort((a, b) => (b.size || 0) - (a.size || 0)).slice(0, 5);
+  const largestHtml = largest.map(f => `
+    <div style="display:flex; align-items:center; justify-content:space-between; padding:8px 12px; background:var(--bg-3); border-radius:var(--r-sm); font-size:12.5px; color:var(--text-1);">
+      <span style="font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:260px;" title="${esc(f.name)}"><i class="fas ${fileIcon(f.type)}" style="margin-right:8px; color:var(--primary);"></i>${esc(f.name)}</span>
+      <span style="color:var(--text-2); font-weight:600;">${fmtBytes(f.size)}</span>
+    </div>`).join("");
+
+  if (el("analytics-largest-files")) el("analytics-largest-files").innerHTML = largestHtml || `<div style="font-size:12px; color:var(--text-3); text-align:center;">No files found</div>`;
+  show("storage-analytics-modal");
+}
 function el(id) { return document.getElementById(id); }
 function show(id) { el(id)?.classList.remove("hidden"); }
 function hide(id) { el(id)?.classList.add("hidden"); }
@@ -2965,6 +3912,18 @@ window.setGuide = setGuide;
 window.moveGuide = moveGuide;
 window.toggleHelpDrawer = toggleHelpDrawer;
 window.toggleUploadPanel = toggleUploadPanel;
+window.toggleTheme = toggleTheme;
+window.showStorageAnalytics = showStorageAnalytics;
+window.renderStorageAnalyticsDetail = renderStorageAnalyticsDetail;
+window.startTour = startTour;
+window.checkOnboardingTour = checkOnboardingTour;
+window.highlightFileCard = highlightFileCard;
+
+window.downloadFolder = downloadFolder;
+window.bulkDownloadQueue = bulkDownloadQueue;
+window.copyShareLink = copyShareLink;
+window.copyTelegramMessageLink = copyTelegramMessageLink;
+window.shareToTelegram = shareToTelegram;
 
 window.setLoginMethod = setLoginMethod;
 window.sendCode = sendCode;
