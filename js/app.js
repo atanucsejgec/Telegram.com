@@ -1147,24 +1147,30 @@ async function handleUpload(event) {
 }
 
 // Walks pathParts from baseFolderId, reusing existing folders or creating missing ones.
-// Returns the id of the deepest folder.
-function ensureFolderPath(pathParts, baseFolderId) {
+// Returns the id of the deepest folder. Supports an optional folderCache Map for O(1) batch lookups.
+function ensureFolderPath(pathParts, baseFolderId, folderCache = null) {
   let parentId = baseFolderId;
   for (const rawName of pathParts) {
     const name = rawName.trim();
     if (!name) continue;
-    let folder = fileDatabase.folders.find(f => f.parentId === parentId && f.name.toLowerCase() === name.toLowerCase() && !f.trashed);
-    if (!folder) {
-      folder = {
-        id: Date.now().toString(36) + Math.random().toString(36).substr(2, 9),
-        name,
-        parentId,
-        createdDate: new Date().toISOString(),
-        color: FOLDER_COLORS[Math.floor(Math.random() * FOLDER_COLORS.length)]
-      };
-      fileDatabase.folders.push(folder);
+    const cacheKey = `${parentId}:${name.toLowerCase()}`;
+    let folderId = folderCache ? folderCache.get(cacheKey) : null;
+    if (!folderId) {
+      let folder = fileDatabase.folders.find(f => f.parentId === parentId && f.name.toLowerCase() === name.toLowerCase() && !f.trashed);
+      if (!folder) {
+        folder = {
+          id: Date.now().toString(36) + Math.random().toString(36).substr(2, 9),
+          name,
+          parentId,
+          createdDate: new Date().toISOString(),
+          color: FOLDER_COLORS[Math.floor(Math.random() * FOLDER_COLORS.length)]
+        };
+        fileDatabase.folders.push(folder);
+      }
+      folderId = folder.id;
+      if (folderCache) folderCache.set(cacheKey, folderId);
     }
-    parentId = folder.id;
+    parentId = folderId;
   }
   return parentId;
 }
@@ -1191,7 +1197,7 @@ async function uploadEntries(entries) {
   const list = el("upload-list");
   const panel = el("upload-panel");
   if (panel) {
-    if (el("upload-panel-title")) el("upload-panel-title").innerHTML = `<i class="fas fa-cloud-upload-alt"></i> File Uploads`;
+    if (el("upload-panel-title")) el("upload-panel-title").innerHTML = `<i class="fas fa-cloud-upload-alt"></i> File Uploads (${entries.length})`;
     show("upload-panel");
     panel.classList.remove("minimized");
     const icon = panel.querySelector(".upload-panel-header button i");
@@ -1199,41 +1205,139 @@ async function uploadEntries(entries) {
   }
   list.innerHTML = "";
   const baseFolderId = currentFolder;
+  const folderCacheMap = new Map();
+
+  const totalFiles = entries.length;
+  let completedFiles = 0;
+  let failedFiles = 0;
+
+  // Render a batch summary header if uploading multiple files
+  let batchSummaryEl = null;
+  let batchBarEl = null;
+  let batchStatusEl = null;
+  let batchPctEl = null;
+
+  if (totalFiles > 1) {
+    batchSummaryEl = document.createElement("div");
+    batchSummaryEl.className = "upload-batch-summary";
+    batchSummaryEl.style.cssText = "padding:10px 14px; background:var(--bg-2); border-bottom:1px solid var(--border); font-size:12px; font-weight:500;";
+    batchSummaryEl.innerHTML = `
+      <div style="display:flex; justify-content:space-between; margin-bottom:6px; color:var(--text-1);">
+        <span id="upload-batch-status">Uploading 0 of ${totalFiles} files</span>
+        <span id="upload-batch-pct">0%</span>
+      </div>
+      <div class="upload-progress" style="height:6px; background:var(--bg-3); border-radius:3px; overflow:hidden;">
+        <div class="upload-progress-bar" id="upload-batch-bar" style="width:0%; background:var(--accent); height:100%; transition:width 0.2s;"></div>
+      </div>
+    `;
+    list.appendChild(batchSummaryEl);
+    batchBarEl = batchSummaryEl.querySelector("#upload-batch-bar");
+    batchStatusEl = batchSummaryEl.querySelector("#upload-batch-status");
+    batchPctEl = batchSummaryEl.querySelector("#upload-batch-pct");
+  }
+
+  const updateBatchProgress = () => {
+    if (!batchSummaryEl) return;
+    const pct = Math.round((completedFiles / totalFiles) * 100);
+    if (batchBarEl) batchBarEl.style.width = pct + "%";
+    if (batchStatusEl) batchStatusEl.textContent = `Uploaded ${completedFiles} of ${totalFiles} files${failedFiles ? ' (' + failedFiles + ' failed)' : ''}`;
+    if (batchPctEl) batchPctEl.textContent = pct + "%";
+  };
 
   const items = [];
   let idx = 0;
   for (const { file: f, relativePath } of entries) {
-    const displayName = relativePath || f.name;
     const taskId = `up_${Date.now()}_${idx++}_${Math.random().toString(36).substr(2, 4)}`;
-    const item = document.createElement("div");
-    item.className = "upload-item";
-    item.id = `upload-item-${taskId}`;
-    item.innerHTML = `<div class="upload-item-icon"><i class="${fileIcon(fileTypeFromMime(f.type, f.name))}"></i></div>
+    items.push({
+      taskId,
+      file: f,
+      relativePath,
+      element: null,
+      progressBar: null,
+      statusLabel: null
+    });
+  }
+
+  const MAX_VISIBLE_DOM_ITEMS = 25;
+
+  function renderItemDOM(item) {
+    if (item.element) return item.element;
+    const displayName = item.relativePath || item.file.name;
+    const itemEl = document.createElement("div");
+    itemEl.className = "upload-item";
+    itemEl.id = `upload-item-${item.taskId}`;
+    itemEl.innerHTML = `<div class="upload-item-icon"><i class="${fileIcon(fileTypeFromMime(item.file.type, item.file.name))}"></i></div>
     <div class="upload-item-info">
       <div class="upload-item-name">${esc(displayName)}</div>
       <div class="upload-progress"><div class="upload-progress-bar" style="width:0%"></div></div>
       <div class="upload-status">Preparing...</div>
     </div>
-    <button class="upload-item-dismiss" onclick="window.cancelUpload('${taskId}')" style="background:none; border:none; color:var(--text-3); cursor:pointer; padding:4px;" aria-label="Cancel upload"><i class="fas fa-times"></i></button>`;
-    list.appendChild(item);
-    items.push({ taskId, file: f, relativePath, progressBar: item.querySelector(".upload-progress-bar"), statusLabel: item.querySelector(".upload-status") });
+    <button class="upload-item-dismiss" onclick="window.cancelUpload('${item.taskId}')" style="background:none; border:none; color:var(--text-3); cursor:pointer; padding:4px;" aria-label="Cancel upload"><i class="fas fa-times"></i></button>`;
+
+    // Windowing: Trim old completed DOM nodes if exceeding max visible count
+    const minHeaderOffset = batchSummaryEl ? 1 : 0;
+    if (list.children.length >= MAX_VISIBLE_DOM_ITEMS + minHeaderOffset) {
+      for (let i = minHeaderOffset; i < list.children.length; i++) {
+        const child = list.children[i];
+        if (child.dataset.finished === "true") {
+          list.removeChild(child);
+          break;
+        }
+      }
+    }
+
+    list.appendChild(itemEl);
+    item.element = itemEl;
+    item.progressBar = itemEl.querySelector(".upload-progress-bar");
+    item.statusLabel = itemEl.querySelector(".upload-status");
+    return itemEl;
   }
 
   let nextIndex = 0;
+  let filesSinceLastDBSave = 0;
+
   const workers = Array.from({ length: Math.min(MAX_PARALLEL_UPLOADS, items.length) }, async () => {
     while (nextIndex < items.length) {
       const item = items[nextIndex++];
-      await uploadSingleEntry(item, baseFolderId);
+      renderItemDOM(item);
+
+      const success = await uploadSingleEntry(item, baseFolderId, folderCacheMap);
+      if (success) completedFiles++;
+      else failedFiles++;
+
+      filesSinceLastDBSave++;
+      if (filesSinceLastDBSave >= 25) {
+        filesSinceLastDBSave = 0;
+        saveDBToTelegram().catch(err => console.warn("Incremental DB save warning:", err));
+      }
+
+      if (item.element) {
+        item.element.dataset.finished = "true";
+      }
+
+      updateBatchProgress();
+
+      // Yield event loop briefly between files to keep UI interactive
+      await new Promise(r => setTimeout(r, 0));
     }
   });
+
   await Promise.all(workers);
 
   await saveDBToTelegram();
   loadFiles();
-  setTimeout(() => { hide("upload-panel"); list.innerHTML = ""; }, 5000);
+
+  if (totalFiles > 1) {
+    toast(`Folder upload complete! (${completedFiles} uploaded${failedFiles ? ', ' + failedFiles + ' failed' : ''})`, failedFiles ? "warning" : "success");
+  }
+
+  setTimeout(() => {
+    hide("upload-panel");
+    list.innerHTML = "";
+  }, 6000);
 }
 
-async function uploadSingleEntry(item, baseFolderId) {
+async function uploadSingleEntry(item, baseFolderId, folderCacheMap = null) {
   const f = item.file;
   const taskId = item.taskId;
   const controller = new AbortController();
@@ -1243,33 +1347,34 @@ async function uploadSingleEntry(item, baseFolderId) {
     let destFolderId = baseFolderId;
     if (item.relativePath) {
       const parts = item.relativePath.split("/").slice(0, -1);
-      if (parts.length) destFolderId = ensureFolderPath(parts, baseFolderId);
+      if (parts.length) destFolderId = ensureFolderPath(parts, baseFolderId, folderCacheMap);
     }
 
-    item.statusLabel.textContent = "Uploading... 0%";
+    if (item.statusLabel) item.statusLabel.textContent = "Uploading... 0%";
     const startTime = Date.now();
+
     const arrayBuffer = await f.arrayBuffer();
-    if (controller.signal.aborted) return;
-    const buffer = Buffer.from(arrayBuffer);
-    const customFile = new CustomFile(f.name, f.size, "", buffer);
+    if (controller.signal.aborted) return false;
+
+    const customFile = new CustomFile(f.name, f.size, "", Buffer.from(arrayBuffer));
 
     const result = await client.sendFile(targetPeer, {
       file: customFile,
       caption: `🗂 TG-Drive | ${item.relativePath || f.name}`,
       forceDocument: true,
       progressCallback: (progress) => {
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || !item.statusLabel) return;
         const pct = Math.round(progress * 100);
         const bytes = progress * f.size;
         const elapsed = (Date.now() - startTime) / 1000;
         const speed = elapsed > 0 ? bytes / elapsed : 0;
         const eta = speed > 0 ? (f.size - bytes) / speed : 0;
-        item.progressBar.style.width = pct + "%";
-        item.statusLabel.textContent = `Uploading... ${pct}% • ${fmtBytes(speed)}/s • ${Math.ceil(eta)}s left`;
+        if (item.progressBar) item.progressBar.style.width = pct + "%";
+        if (item.statusLabel) item.statusLabel.textContent = `Uploading... ${pct}% • ${fmtBytes(speed)}/s • ${Math.ceil(eta)}s left`;
       }
     });
 
-    if (controller.signal.aborted) return;
+    if (controller.signal.aborted) return false;
 
     const fileEntry = {
       id: Date.now().toString(36) + Math.random().toString(36).substr(2, 9),
@@ -1287,16 +1392,26 @@ async function uploadSingleEntry(item, baseFolderId) {
 
     fileDatabase.files.push(fileEntry);
 
-    item.statusLabel.textContent = "✓ Complete";
-    item.statusLabel.className = "upload-status success";
-    item.progressBar.style.width = "100%";
-    item.progressBar.style.background = "var(--success)";
+    if (item.statusLabel) {
+      item.statusLabel.textContent = "✓ Complete";
+      item.statusLabel.className = "upload-status success";
+    }
+    if (item.progressBar) {
+      item.progressBar.style.width = "100%";
+      item.progressBar.style.background = "var(--success)";
+    }
+    return true;
   } catch (err) {
-    if (controller.signal.aborted) return;
+    if (controller.signal.aborted) return false;
     console.error("Upload failed:", err);
-    item.statusLabel.textContent = "✕ Failed";
-    item.statusLabel.className = "upload-status danger";
-    item.progressBar.style.background = "var(--danger)";
+    if (item.statusLabel) {
+      item.statusLabel.textContent = "✕ Failed";
+      item.statusLabel.className = "upload-status danger";
+    }
+    if (item.progressBar) {
+      item.progressBar.style.background = "var(--danger)";
+    }
+    return false;
   } finally {
     activeUploadTasks.delete(taskId);
   }
@@ -3352,23 +3467,43 @@ function setupDragDrop() {
   });
 }
 
-// Recursively reads a dropped FileSystemEntry (file or directory) into {file, relativePath} pairs
-function collectDroppedEntries(entry, basePath, out) {
-  return new Promise(resolve => {
-    if (entry.isFile) {
-      entry.file(f => { out.push({ file: f, relativePath: basePath ? basePath + f.name : "" }); resolve(); }, () => resolve());
-    } else if (entry.isDirectory) {
-      const reader = entry.createReader();
-      const readBatch = () => {
-        reader.readEntries(async batch => {
-          if (!batch.length) return resolve();
-          for (const child of batch) await collectDroppedEntries(child, basePath + entry.name + "/", out);
-          readBatch(); // readEntries returns at most ~100 entries per call
-        }, () => resolve());
+// Recursively reads a dropped FileSystemEntry (file or directory) into {file, relativePath} pairs with non-blocking traversal
+let _lastScanToastTime = 0;
+async function collectDroppedEntries(entry, basePath, out) {
+  if (!entry) return;
+  if (entry.isFile) {
+    await new Promise(resolve => {
+      entry.file(f => {
+        out.push({ file: f, relativePath: basePath ? basePath + f.name : "" });
+        resolve();
+      }, () => resolve());
+    });
+  } else if (entry.isDirectory) {
+    const reader = entry.createReader();
+    const children = await new Promise(resolve => {
+      const allBatchEntries = [];
+      const readNextBatch = () => {
+        reader.readEntries(batch => {
+          if (!batch || !batch.length) return resolve(allBatchEntries);
+          allBatchEntries.push(...batch);
+          readNextBatch();
+        }, () => resolve(allBatchEntries));
       };
-      readBatch();
-    } else resolve();
-  });
+      readNextBatch();
+    });
+
+    for (const child of children) {
+      await collectDroppedEntries(child, basePath + entry.name + "/", out);
+      if (out.length % 25 === 0) {
+        await new Promise(r => setTimeout(r, 0));
+        const now = Date.now();
+        if (now - _lastScanToastTime > 1200) {
+          _lastScanToastTime = now;
+          toast(`Scanning folder... ${out.length} files found`, "info");
+        }
+      }
+    }
+  }
 }
 
 // ==================== KEYBOARD ====================
