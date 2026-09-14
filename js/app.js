@@ -238,39 +238,29 @@ document.addEventListener("DOMContentLoaded", () => {
   setupDragDrop();
   setupKeys();
   setupRipples();
-  registerDownloadSW();
   registerAppSW();
   document.addEventListener("click", e => {
     if (!document.getElementById("context-menu").contains(e.target)) hideContext();
   });
 });
 
-// ==================== SERVICE WORKER FOR MOBILE DOWNLOADS ====================
+// ==================== UNIFIED SERVICE WORKER REGISTRATION ====================
 let swReady = false;
-function registerDownloadSW() {
-  if (!('serviceWorker' in navigator)) return;
-  navigator.serviceWorker.register('./sw-download.js', { scope: './' })
-    .then(reg => {
-      console.log('Download SW registered, scope:', reg.scope);
-      // Wait for the SW to be active
-      const sw = reg.active || reg.installing || reg.waiting;
-      if (sw && sw.state === 'activated') { swReady = true; return; }
-      if (sw) {
-        sw.addEventListener('statechange', () => {
-          if (sw.state === 'activated') swReady = true;
-        });
-      }
-      // Also mark ready if controller already exists (page reload)
-      if (navigator.serviceWorker.controller) swReady = true;
-    })
-    .catch(err => console.warn('Download SW registration failed:', err));
-}
-
 function registerAppSW() {
   if (!('serviceWorker' in navigator)) return;
   navigator.serviceWorker.register('./sw.js')
-    .then(reg => console.log('App SW registered, scope:', reg.scope))
-    .catch(err => console.warn('App SW registration failed:', err));
+    .then(reg => {
+      console.log('Unified SW registered, scope:', reg.scope);
+      const sw = reg.active || reg.installing || reg.waiting;
+      if (sw && sw.state === 'activated') { swReady = true; window.swReady = true; return; }
+      if (sw) {
+        sw.addEventListener('statechange', () => {
+          if (sw.state === 'activated') { swReady = true; window.swReady = true; }
+        });
+      }
+      if (navigator.serviceWorker.controller) { swReady = true; window.swReady = true; }
+    })
+    .catch(err => console.warn('Unified SW registration failed:', err));
 }
 
 let deferredPrompt = null;
@@ -310,29 +300,34 @@ class SwWritableAdapter {
   }
   /** Sequential write — data is a Uint8Array or ArrayBuffer */
   async write(data) {
-    if (this.closed) return;
+    if (this.closed) throw new Error("Stream is closed");
     // Accept both { data: ... } object form and raw buffer
     let bytes = data;
     if (data && data.data) bytes = data.data;
-    // Transfer the buffer for zero-copy perf
-    if (bytes instanceof Uint8Array) {
-      const copy = bytes.slice(); // must copy before transfer
-      this.port.postMessage(copy.buffer, [copy.buffer]);
-    } else if (bytes instanceof ArrayBuffer) {
+    if (bytes instanceof ArrayBuffer) {
       this.port.postMessage(bytes, [bytes]);
-    } else {
-      this.port.postMessage(bytes);
+      return;
     }
+    // Always transfer an ArrayBuffer that holds *exactly* this chunk. A typed-array view
+    // (e.g. a GramJS Buffer, whose .slice() is a view) may sit at an offset inside a larger
+    // buffer — transferring `.buffer` would ship the whole thing, header bytes included.
+    const view = ArrayBuffer.isView(bytes)
+      ? new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+      : new Uint8Array(bytes);
+    const exact = (view.byteOffset === 0 && view.byteLength === view.buffer.byteLength)
+      ? view.buffer
+      : view.slice().buffer;
+    this.port.postMessage(exact, [exact]);
   }
   async close() {
     if (this.closed) return;
     this.closed = true;
     this.port.postMessage({ done: true });
   }
-  async abort() {
+  async abort(reason) {
     if (this.closed) return;
     this.closed = true;
-    this.port.postMessage({ error: 'cancelled' });
+    this.port.postMessage({ error: (reason && reason.message) || 'cancelled' });
   }
 }
 
@@ -1432,30 +1427,39 @@ class DownloadTask {
     this.resolve = resolve;
     this.reject = reject;
     this.item = item;
-    
+
     this.isPaused = false;
     this.isCancelled = false;
+    this.isFinished = false;
     this.sequential = sequential;
     // Telegram upload.getFile limit MUST be a multiple of 4KB, up to 1MB (1048576) or 512KB (524288) for optimum TCP window utilization
     // Using 1MB (1048576) for maximum throughput per RPC request
     this.CHUNK_SIZE = 1048576; // 1MB
+    // Max bytes fetched-but-not-yet-written before fetch workers pause (backpressure).
+    // Keeps memory bounded while letting the network run ahead of the disk.
+    this.MAX_PENDING_BYTES = 32 * 1024 * 1024;
     this.fileSize = Number(msg.media?.document?.size || 0);
     this.numChunks = Math.ceil(this.fileSize / this.CHUNK_SIZE);
     this.currentChunk = 0;
     this.downloadedBytes = 0;
     this.hasError = false;
     this.lastError = null;
-    
+
     this.startTime = Date.now();
     this.activeWorkers = 0;
-    
+
     this.progressBar = item.querySelector(".upload-progress-bar");
     this.statusLabel = item.querySelector(".upload-status");
-    
-    // Sequential mode for Service Worker streams (no random-access writes)
-    this.nextFlushIdx = 0;      // next chunk index to flush
-    this.reorderBuf = new Map(); // chunkIdx -> Uint8Array
-    
+
+    // Fetch workers drop chunks into reorderBuf; a single writer pump drains them
+    // strictly in order. Workers never wait on the disk except for backpressure,
+    // so the network stays saturated while the file is written sequentially.
+    this.nextFlushIdx = 0;        // next chunk index to write
+    this.reorderBuf = new Map();  // chunkIdx -> Uint8Array
+    this.pendingBytes = 0;        // bytes sitting in reorderBuf
+    this.pumpPromise = null;      // in-flight writer pump (null when idle)
+    this.drainWaiters = [];       // workers blocked on backpressure
+
     if (this.fileSize > 0) {
       this.location = new this.Api.InputDocumentFileLocation({
         id: msg.media.document.id,
@@ -1466,10 +1470,25 @@ class DownloadTask {
     }
   }
 
+  /**
+   * Copy a chunk into a fresh, standalone Uint8Array (byteOffset 0, own ArrayBuffer).
+   * GramJS returns Buffer views over its socket receive buffer and Buffer.slice()
+   * returns a *view*, not a copy — transferring/writing such a view leaks header bytes.
+   */
+  static toOwnedBytes(chunk) {
+    if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk.slice(0));
+    const view = ArrayBuffer.isView(chunk)
+      ? new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+      : new Uint8Array(chunk);
+    const copy = new Uint8Array(view.byteLength);
+    copy.set(view);
+    return copy;
+  }
+
   updateProgress() {
     if (!this.progressBar || !this.statusLabel) return;
     const pct = Math.max(0, Math.min(100, Math.round((this.downloadedBytes / this.fileSize) * 100)));
-    
+
     let etaStr = "";
     if (!this.isPaused) {
       const elapsedMs = Date.now() - this.startTime;
@@ -1477,7 +1496,7 @@ class DownloadTask {
         const bytesPerSec = this.downloadedBytes / (elapsedMs / 1000);
         const remainingBytes = this.fileSize - this.downloadedBytes;
         const remainingSecs = Math.round(remainingBytes / bytesPerSec);
-        
+
         if (remainingSecs >= 60) {
           const mins = Math.floor(remainingSecs / 60);
           const secs = remainingSecs % 60;
@@ -1515,7 +1534,7 @@ class DownloadTask {
         this.progressBar.style.background = "var(--success)";
       }
     }
-    
+
     const playPauseBtn = this.item.querySelector('.upload-item-pause');
     if(playPauseBtn) playPauseBtn.remove();
   }
@@ -1526,12 +1545,14 @@ class DownloadTask {
         const iter = this.client.iterDownload({ file: this.msg.media, requestSize: this.CHUNK_SIZE });
         for await (const chunk of iter) {
           if (this.isCancelled) break;
-          await this.writable.write(chunk);
+          await this.writable.write(DownloadTask.toOwnedBytes(chunk));
         }
         if (this.isCancelled) throw new Error("Cancelled");
+        await this.writable.close();
         this.finalizeUI(null);
         this.resolve();
       } catch (e) {
+        try { await this.writable.abort(e); } catch (_) {}
         this.finalizeUI(e);
         this.reject(e);
       }
@@ -1543,80 +1564,216 @@ class DownloadTask {
     this.spawnWorkers();
   }
 
-  /** Flush any buffered chunks that are now in order (sequential mode only) */
-  async flushReorderBuf() {
-    while (this.reorderBuf.has(this.nextFlushIdx)) {
-      const bytes = this.reorderBuf.get(this.nextFlushIdx);
-      this.reorderBuf.delete(this.nextFlushIdx);
-      this.nextFlushIdx++;
-      await this.writable.write(bytes);
-      this.downloadedBytes += bytes.length;
-      this.updateProgress();
+  /** Wake fetch workers blocked on backpressure */
+  notifyDrain() {
+    const waiters = this.drainWaiters;
+    this.drainWaiters = [];
+    waiters.forEach(fn => fn());
+  }
+
+  /** Block a fetch worker until the pending buffer has drained below the cap */
+  waitForDrain() {
+    return new Promise(res => this.drainWaiters.push(res));
+  }
+
+  /**
+   * Single writer pump: drains reorderBuf in strict chunk order.
+   * Only one pump runs at a time; it exits when the next chunk isn't available yet
+   * and is re-kicked by whichever worker delivers it.
+   */
+  pumpWrites() {
+    if (this.pumpPromise) return this.pumpPromise;
+    const pump = (async () => {
+      try {
+        while (this.reorderBuf.has(this.nextFlushIdx) && !this.isCancelled && !this.hasError) {
+          const bytes = this.reorderBuf.get(this.nextFlushIdx);
+          this.reorderBuf.delete(this.nextFlushIdx);
+          this.nextFlushIdx++;
+          this.pendingBytes -= bytes.byteLength;
+          this.notifyDrain();
+
+          await this.writable.write(bytes);
+          this.downloadedBytes += bytes.byteLength;
+          this.updateProgress();
+        }
+      } catch (writeErr) {
+        if (!this.isCancelled) {
+          console.error("Stream write failed:", writeErr);
+          this.hasError = true;
+          this.lastError = writeErr;
+        }
+      } finally {
+        this.notifyDrain();
+      }
+    })();
+    // Assign after creation: if the pump had nothing to do it has already settled synchronously,
+    // and clearing it from inside the IIFE would run *before* this assignment.
+    this.pumpPromise = pump;
+    pump.then(() => { if (this.pumpPromise === pump) this.pumpPromise = null; });
+    return pump;
+  }
+
+  async fetchChunk(chunkIdx) {
+    const offset = chunkIdx * this.CHUNK_SIZE;
+    let retries = 5;
+    while (retries > 0 && !this.hasError && !this.isCancelled) {
+      try {
+        const result = await this.client.invoke(new this.Api.upload.GetFile({
+          location: this.location,
+          offset: offset,
+          limit: this.CHUNK_SIZE,
+          precise: true
+        }));
+        if (!result || !result.bytes || result.bytes.length === 0) {
+          throw new Error(`Empty chunk received at chunk index ${chunkIdx}`);
+        }
+        return DownloadTask.toOwnedBytes(result.bytes);
+      } catch (e) {
+        retries--;
+        if (this.isCancelled) throw e;
+        const isFlood = e.errorMessage && e.errorMessage.startsWith("FLOOD_WAIT_");
+        const waitSec = isFlood ? (parseInt(e.errorMessage.split("_")[2], 10) || 2) : (6 - retries);
+        console.warn(`Chunk ${chunkIdx} fetch failed (${e.message || e.errorMessage || e}), retries left: ${retries}. Waiting ${waitSec}s...`);
+        if (retries === 0) throw e;
+        await new Promise(r => setTimeout(r, waitSec * 1000));
+      }
     }
+    throw this.lastError || new Error("Download aborted");
   }
 
   async spawnWorkers() {
     if (this.isPaused || this.isCancelled || this.currentChunk >= this.numChunks) return;
-    
-    // For mobile sequential streams, use 6 parallel workers to saturate connection and offset MessagePort IPC overhead
+
+    // Use 4 concurrent workers (or 6 for Service Worker streaming)
     const WORKERS = this.sequential ? 6 : 4;
     const promises = [];
-    
+
     for (let i = 0; i < WORKERS; i++) {
       promises.push((async () => {
         this.activeWorkers++;
-        while (this.currentChunk < this.numChunks && !this.hasError && !this.isPaused && !this.isCancelled) {
-          const chunkIdx = this.currentChunk++;
-          const offset = chunkIdx * this.CHUNK_SIZE;
-
-          try {
-            const result = await this.client.invoke(new this.Api.upload.GetFile({
-              location: this.location,
-              offset: offset,
-              limit: this.CHUNK_SIZE
-            }));
-            
-            if (result && result.bytes && !this.hasError && !this.isCancelled) {
-              if (this.sequential) {
-                // Buffer chunk and flush in order
-                this.reorderBuf.set(chunkIdx, result.bytes);
-                await this.flushReorderBuf();
-              } else {
-                // Random-access write (File System Access API)
-                await this.writable.write({ type: "write", position: offset, data: result.bytes });
-                this.downloadedBytes += result.bytes.length;
-                this.updateProgress();
-              }
+        try {
+          while (this.currentChunk < this.numChunks && !this.hasError && !this.isPaused && !this.isCancelled) {
+            // Backpressure: don't run more than MAX_PENDING_BYTES ahead of the disk
+            while (this.pendingBytes >= this.MAX_PENDING_BYTES && !this.hasError && !this.isCancelled && !this.isPaused) {
+              await this.waitForDrain();
             }
-          } catch (e) {
+            // Re-check after waiting: another worker may have claimed the last chunk meanwhile
+            if (this.hasError || this.isCancelled || this.isPaused || this.currentChunk >= this.numChunks) break;
+
+            const chunkIdx = this.currentChunk++;
+            const bytes = await this.fetchChunk(chunkIdx);
+            if (this.hasError || this.isCancelled) break;
+
+            this.reorderBuf.set(chunkIdx, bytes);
+            this.pendingBytes += bytes.byteLength;
+            this.pumpWrites(); // fire-and-forget; pump serializes writes
+          }
+        } catch (e) {
+          if (!this.isCancelled && !this.hasError) {
             this.hasError = true;
             this.lastError = e;
           }
+        } finally {
+          this.activeWorkers--;
+          this.notifyDrain();
         }
-        this.activeWorkers--;
       })());
     }
 
     await Promise.all(promises);
-    
+
     if (this.activeWorkers === 0) {
       if (this.isCancelled) {
         this.finalizeUI();
         this.reject(new Error("Cancelled"));
       } else if (this.hasError) {
-        this.finalizeUI(this.lastError);
-        this.reject(this.lastError);
-      } else if (!this.isPaused && this.currentChunk >= this.numChunks) {
-        // Close the writable stream to finalize the file (converts .crswap to real file)
-        try { await this.writable.close(); } catch(e) { console.warn("writable.close() in task:", e); }
-        this.finalizeUI(null);
-        this.resolve();
+        await this.fail(this.lastError);
+      } else if (this.currentChunk >= this.numChunks) {
+        // Every chunk has been fetched (even if the user hit pause in the last moment):
+        // nothing is left to pause, so finalize the file.
+        await this.finish();
       }
+      else if (!this.isPaused) {
+        // resume() flipped the flag while workers were winding down — pick the fetch back up
+        this.spawnWorkers();
+      }
+      // else: paused mid-download — resume() will spawn workers again
+    }
+  }
+
+  async fail(err) {
+    if (this.isFinished) return;
+    this.isFinished = true;
+    try { await this.writable.abort(err); } catch (_) {}
+    this.finalizeUI(err);
+    this.reject(err);
+  }
+
+  /** All chunks fetched: drain the writer, then close the stream exactly once. */
+  async finish() {
+    if (this.isFinished) return;
+    this.isFinished = true;
+    this.isPaused = false;
+    try {
+      // Drain everything still buffered (the pump may be idle if the last chunk landed out of order)
+      while ((this.pumpPromise || this.reorderBuf.has(this.nextFlushIdx)) && !this.hasError && !this.isCancelled) {
+        await this.pumpWrites();
+      }
+      if (this.isCancelled) throw new Error("Cancelled");
+      if (this.hasError) throw this.lastError;
+      if (this.nextFlushIdx !== this.numChunks) {
+        throw new Error(`Incomplete download: wrote ${this.nextFlushIdx}/${this.numChunks} chunks`);
+      }
+      if (this.statusLabel) this.statusLabel.textContent = "Finalizing file...";
+
+      // close() finalizes the file (renames .crswap -> real file). A WHATWG stream can only be
+      // closed once; if this rejects the stream is errored for good, so never retry it.
+      await this.writable.close();
+
+      this.finalizeUI(null);
+      this.resolve();
+    } catch (finalErr) {
+      console.error(`Finalizing "${this.fileName}" failed:`, finalErr && finalErr.name, finalErr);
+
+      const isStateCachedErr = finalErr && (
+        finalErr.name === 'InvalidModificationError' ||
+        finalErr.name === 'InvalidStateError' ||
+        (finalErr.message && (
+          finalErr.message.includes('state cached in an interface object') ||
+          finalErr.message.includes('state had changed')
+        ))
+      );
+
+      // If all chunks were written to disk (nextFlushIdx === numChunks), the .crswap file has 100% of the data!
+      // OneDrive / Windows Defender modified the destination timestamp during download, preventing Chrome's auto-rename.
+      // DO NOT call abort() here, because abort() deletes the user's downloaded .crswap file!
+      if (isStateCachedErr || (this.nextFlushIdx === this.numChunks && this.downloadedBytes >= this.fileSize)) {
+        console.warn(`[DownloadTask] "${this.fileName}" is 100% written on disk as .crswap. External OS/OneDrive modified timestamp.`);
+        if (this.statusLabel) {
+          this.statusLabel.textContent = "✓ 100% Downloaded (Rename .crswap to use)";
+          this.statusLabel.className = "upload-status success";
+          this.statusLabel.title = "Download complete! Windows/OneDrive modified the folder during download. In Windows Explorer, delete the 0 KB file and remove .crswap from the file extension to open it.";
+        }
+        if (this.progressBar) {
+          this.progressBar.style.width = "100%";
+          this.progressBar.style.background = "var(--success)";
+        }
+        const playPauseBtn = this.item.querySelector('.upload-item-pause');
+        if (playPauseBtn) playPauseBtn.remove();
+
+        toast(`"${this.fileName}" is 100% downloaded! Simply remove .crswap from the file in Windows Explorer.`, "success");
+        this.resolve();
+        return;
+      }
+
+      try { await this.writable.abort(finalErr); } catch (_) {}
+      this.finalizeUI(finalErr);
+      this.reject(finalErr);
     }
   }
 
   pause() {
-    if (this.currentChunk >= this.numChunks || this.isCancelled || this.hasError) return;
+    if (this.isFinished || this.currentChunk >= this.numChunks || this.isCancelled || this.hasError) return;
     this.isPaused = true;
     this.updateProgress();
     const icon = this.item.querySelector('.upload-item-pause i');
@@ -1624,22 +1781,30 @@ class DownloadTask {
   }
 
   resume() {
-    if (this.currentChunk >= this.numChunks || this.isCancelled || this.hasError) return;
+    if (this.isFinished || this.isCancelled || this.hasError) return;
     this.isPaused = false;
     this.startTime = Date.now();
     this.updateProgress();
     const icon = this.item.querySelector('.upload-item-pause i');
     if(icon) icon.className = "fas fa-pause";
-    this.spawnWorkers();
+    this.notifyDrain();
+    if (this.activeWorkers === 0) {
+      if (this.currentChunk >= this.numChunks) this.finish();
+      else this.spawnWorkers();
+    }
   }
 
   async cancel() {
     if (this.isCancelled) return;
     this.isCancelled = true;
     this.isPaused = false;
+    this.reorderBuf.clear();
+    this.pendingBytes = 0;
+    this.notifyDrain();
     try { await this.writable.abort(); } catch(e) { console.error("Abort error:", e); }
-    
-    if (this.activeWorkers === 0) {
+
+    if (this.activeWorkers === 0 && !this.isFinished) {
+      this.isFinished = true;
       this.finalizeUI();
       this.reject(new Error("Cancelled"));
     }
@@ -1794,10 +1959,8 @@ window.swStreamDownload = async function(client, Api, msg, fileName, mime, size)
   // Use sequential mode for SW stream (reorder buffer)
   return new Promise((resolve, reject) => {
     const task = new DownloadTask(client, Api, msg, writable, fileName,
-      // resolve: all chunks written — close the SW port to signal stream end
-      () => { writable.close(); resolve(); },
-      // reject: error — abort the SW stream
-      (err) => { writable.abort(); reject(err); },
+      () => resolve(),
+      (err) => reject(err),
       item, true /* sequential */
     );
     window._downloadTasks.set(taskId, task);
@@ -1810,36 +1973,55 @@ window.swStreamDownload = async function(client, Api, msg, fileName, mime, size)
 async function downloadFile(id, name) {
   const file = fileDatabase.files.find(f => f.id === id) || allFiles.find(f => f.id === id);
   const finalName = name || file?.name || "download";
+
+  // Helper to remove any failed drawer items for this file name so errors don't linger upon fallback
+  const cleanFailedDrawerItems = () => {
+    const failedItems = document.querySelectorAll("#upload-list .upload-item");
+    failedItems.forEach(itemEl => {
+      const nameEl = itemEl.querySelector(".upload-item-name");
+      const statusEl = itemEl.querySelector(".upload-status.error");
+      if (nameEl && nameEl.textContent === finalName && statusEl) {
+        itemEl.remove();
+      }
+    });
+  };
   
   // 1. Direct-to-Disk Streaming (Desktop Chrome/Edge/Opera)
   if (window.showSaveFilePicker) {
     let writable;
+    let streamStarted = false;
     try {
       const handle = await window.showSaveFilePicker({ suggestedName: finalName });
-      writable = await handle.createWritable();
+      writable = await handle.createWritable({ keepExistingData: false });
       
       toast(`Downloading "${finalName}"... (Streaming direct to disk)`, "info");
       
       const messages = await client.getMessages(targetPeer, { ids: [file.messageId] });
       if (!messages?.[0] || !messages[0].media) throw new Error("File not found on Telegram");
       
+      // DownloadTask owns the stream from here: it closes it on success and aborts it on failure.
+      streamStarted = true;
       await window.fastStreamDownload(client, Api, messages[0], writable, finalName);
-      
-      // writable.close() is now handled inside DownloadTask on success
       
       toast(`"${finalName}" downloaded successfully`, "success");
       return;
     } catch (e) {
-      if (e.name === 'AbortError') return;
-      // Safety net: ensure writable is closed so .crswap is finalized even on error
-      if (writable) { try { await writable.close(); } catch(_) {} }
-      console.error("Stream download failed:", e);
-      toast("Stream download failed, trying alternative...", "warning");
+      if (e.name === 'AbortError' && !streamStarted) return; // user dismissed the save dialog
+      console.error("Direct stream download failed:", e);
+      if (streamStarted) {
+        // The transfer itself failed (or the file could not be finalized). Restarting it through
+        // the Service Worker would just download the whole file again — report it instead.
+        toast(`Download of "${finalName}" failed: ${e.message || e}`, "error");
+        return;
+      }
+      if (writable) { try { await writable.abort(); } catch(_) {} }
+      cleanFailedDrawerItems();
+      toast("Could not open the file for writing, trying Service Worker stream...", "warning");
     }
   }
 
-  // 2. Service Worker Streaming (Mobile Chrome/Safari/Firefox)
-  if (swReady && navigator.serviceWorker?.controller) {
+  // 2. Service Worker Streaming (Mobile Chrome/Safari/Firefox & Desktop fallback)
+  if (navigator.serviceWorker?.controller) {
     try {
       toast(`Downloading "${finalName}"... (Streaming via Service Worker)`, "info");
       
@@ -1852,6 +2034,7 @@ async function downloadFile(id, name) {
       return;
     } catch (e) {
       console.error("SW stream download failed:", e);
+      cleanFailedDrawerItems();
       toast("Stream download failed, falling back to memory...", "warning");
     }
   }

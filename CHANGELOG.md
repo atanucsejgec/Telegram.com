@@ -2,14 +2,20 @@
 
 All notable changes to the Telegram Drive Serverless project will be documented in this file.
 
-## [2026-09-14 06:10 PM IST]
+## [2026-09-14 09:50 PM IST]
 
 ### Fixed
-- **Direct-to-Disk Download Finalization (`.crswap` Fix)**: Ensured `writable.close()` is called inside `DownloadTask` immediately when all chunks complete, converting `.crswap` temporary files into finalized files. Added safety net handlers in `downloadFile` and `performDownloadMedia` to ensure streams close properly on errors.
-- **Background Tab Download Throttling Prevention (Web Locks API)**: Wrapped `_processDownloadQueue` in `navigator.locks.request('tg-download-active', ...)` to prevent Chromium browsers from aggressively throttling background tabs and pausing active download streams.
-
-### Added
-- **Transfer Drawer Long Filename Tooltip**: Added `title` attributes and CSS glassmorphic hover tooltips (`.upload-item-name[title]:hover::after`) with fade-in animations so truncated file names can be read in full.
+- **Continuous download speed restored (no more burst / stall / burst)**:
+  - `DownloadTask` now uses a **decoupled writer pump**: 4 (direct) / 6 (Service Worker) fetch workers drop chunks into a reorder buffer and a single pump writes them to disk strictly in order. Workers no longer `await` the disk, so the network stays saturated while the file is written sequentially.
+  - **Bounded backpressure**: workers only pause when more than 32 MB is fetched-but-unwritten, keeping memory flat on slow disks (OneDrive folders, HDDs) without ever idling the connection.
+- **`Cannot close a ERRORED writable stream` / `.crswap` never finalized**:
+  - `writable.close()` is called exactly once, in `DownloadTask.finish()`, only after every chunk has been written and verified (`nextFlushIdx === numChunks`). The stream is never touched again after a failure; the *original* error (name + message) is logged and shown instead of the misleading "ERRORED stream" follow-up error.
+  - A "Finalizing file..." status is shown while the browser runs its post-write checks and renames `.crswap` to the real file (this can take a while for multi-GB files on Windows).
+- **Same file no longer re-downloaded from scratch**: `downloadFile()` (`js/app.js`) and `performDownloadMedia()` (`js/messenger.js`) only fall back to the Service Worker stream if the direct-to-disk stream could not be *opened*. Once a transfer has started, a failure is reported as an error instead of silently restarting the whole download through the fallback path.
+- **Stuck "Paused" downloads**: pausing while the final chunk was in flight left the task un-finalizable (`resume()` bailed because all chunks were dispatched). Finalization now runs whenever all chunks have been fetched, and `resume()` also restarts workers that wound down while the pause flag was set.
+- **Service Worker stream corruption (latent)**: GramJS returns `Buffer` *views* over its socket buffer and `Buffer.slice()` returns another view — `SwWritableAdapter` transferred `.buffer` wholesale (MTProto header bytes included). Chunks are now copied into standalone `Uint8Array`s (`DownloadTask.toOwnedBytes`) and the adapter always transfers an `ArrayBuffer` holding exactly the chunk.
+- **Unified Service Worker**: the `/sw-download/{uuid}` MessagePort interceptor now lives in `public/sw.js` (single registration, cache bumped to `tg-drive-v2`); `js/app.js` no longer registers `sw-download.js` separately.
+- **Transfer Drawer cleanup on fallback**: failed `.upload-item` rows are removed before the Service Worker fallback starts, so red error rows don't linger above the retried transfer.
 
 ## [2026-07-30 02:05 PM IST]
 

@@ -890,31 +890,50 @@ async function performDownloadMedia(client, msg, fileName) {
     mime = "image/jpeg";
   }
 
+  // Helper to remove any failed drawer items for this file name so errors don't linger upon fallback
+  const cleanFailedDrawerItems = () => {
+    const failedItems = document.querySelectorAll("#upload-list .upload-item");
+    failedItems.forEach(itemEl => {
+      const nameEl = itemEl.querySelector(".upload-item-name");
+      const statusEl = itemEl.querySelector(".upload-status.error");
+      if (nameEl && nameEl.textContent === fileName && statusEl) {
+        itemEl.remove();
+      }
+    });
+  };
+
   // 1. Direct-to-Disk Streaming (Desktop Chrome/Edge/Opera)
   if (window.showSaveFilePicker) {
     let writable;
+    let streamStarted = false;
     try {
       const handle = await window.showSaveFilePicker({ suggestedName: fileName });
-      writable = await handle.createWritable();
+      writable = await handle.createWritable({ keepExistingData: false });
       
       toast(`Downloading "${fileName}"... (Streaming direct to disk)`, "info");
       
+      // DownloadTask owns the stream from here: it closes it on success and aborts it on failure.
+      streamStarted = true;
       await window.fastStreamDownload(client, window.tgApi, msg, writable, fileName);
-      
-      // writable.close() is now handled inside DownloadTask on success
       
       toast(`"${fileName}" downloaded successfully`, "success");
       return;
     } catch (e) {
-      if (e.name === 'AbortError') return;
-      // Safety net: ensure writable is closed so .crswap is finalized even on error
-      if (writable) { try { await writable.close(); } catch(_) {} }
-      console.error("Stream download failed:", e);
-      toast("Stream download failed, trying alternative...", "warning");
+      if (e.name === 'AbortError' && !streamStarted) return; // user dismissed the save dialog
+      console.error("Direct stream download failed:", e);
+      if (streamStarted) {
+        // The transfer itself failed (or the file could not be finalized). Restarting it through
+        // the Service Worker would just download the whole file again — report it instead.
+        toast(`Download of "${fileName}" failed: ${e.message || e}`, "error");
+        return;
+      }
+      if (writable) { try { await writable.abort(); } catch(_) {} }
+      cleanFailedDrawerItems();
+      toast("Could not open the file for writing, trying Service Worker stream...", "warning");
     }
   }
 
-  // 2. Service Worker Streaming (Mobile Chrome/Safari/Firefox)
+  // 2. Service Worker Streaming (Mobile Chrome/Safari/Firefox & Desktop fallback)
   if (window.swStreamDownload && navigator.serviceWorker?.controller) {
     try {
       toast(`Downloading "${fileName}"... (Streaming via Service Worker)`, "info");
@@ -925,6 +944,7 @@ async function performDownloadMedia(client, msg, fileName) {
       return;
     } catch (e) {
       console.error("SW stream download failed:", e);
+      cleanFailedDrawerItems();
       toast("Stream download failed, falling back to memory...", "warning");
     }
   }
