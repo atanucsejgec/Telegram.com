@@ -2,6 +2,15 @@
 
 All notable changes to the Telegram Drive Serverless project will be documented in this file.
 
+## [2026-09-14 06:10 PM IST]
+
+### Fixed
+- **Direct-to-Disk Download Finalization (`.crswap` Fix)**: Ensured `writable.close()` is called inside `DownloadTask` immediately when all chunks complete, converting `.crswap` temporary files into finalized files. Added safety net handlers in `downloadFile` and `performDownloadMedia` to ensure streams close properly on errors.
+- **Background Tab Download Throttling Prevention (Web Locks API)**: Wrapped `_processDownloadQueue` in `navigator.locks.request('tg-download-active', ...)` to prevent Chromium browsers from aggressively throttling background tabs and pausing active download streams.
+
+### Added
+- **Transfer Drawer Long Filename Tooltip**: Added `title` attributes and CSS glassmorphic hover tooltips (`.upload-item-name[title]:hover::after`) with fade-in animations so truncated file names can be read in full.
+
 ## [2026-07-30 02:05 PM IST]
 
 ### Added

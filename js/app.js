@@ -1607,6 +1607,8 @@ class DownloadTask {
         this.finalizeUI(this.lastError);
         this.reject(this.lastError);
       } else if (!this.isPaused && this.currentChunk >= this.numChunks) {
+        // Close the writable stream to finalize the file (converts .crswap to real file)
+        try { await this.writable.close(); } catch(e) { console.warn("writable.close() in task:", e); }
         this.finalizeUI(null);
         this.resolve();
       }
@@ -1662,7 +1664,7 @@ window.fastStreamDownload = function(client, Api, msg, writable, fileName) {
     item.className = "upload-item";
     item.innerHTML = `<div class="upload-item-icon"><i class="${fileIcon(fileTypeFromMime("application/octet-stream", fileName))}"></i></div>
     <div class="upload-item-info">
-      <div class="upload-item-name">${esc(fileName)}</div>
+      <div class="upload-item-name" title="${esc(fileName)}">${esc(fileName)}</div>
       <div class="upload-progress"><div class="upload-progress-bar" style="width:0%"></div></div>
       <div class="upload-status">Queued...</div>
     </div>
@@ -1698,23 +1700,33 @@ window._processDownloadQueue = async function() {
   
   const task = window._downloadQueue.shift();
   
-  try {
-    if (!task.isCancelled) {
-      await new Promise((res, rej) => {
-         const origResolve = task.resolve;
-         const origReject = task.reject;
-         
-         task.resolve = (...args) => { res(); origResolve(...args); };
-         task.reject = (...args) => { res(); origReject(...args); };
-         
-         task.start();
-      });
+  // Acquire a Web Lock to prevent the browser from throttling this tab
+  // while a download is active (fixes speed drop when tab is backgrounded)
+  const runDownload = async () => {
+    try {
+      if (!task.isCancelled) {
+        await new Promise((res, rej) => {
+           const origResolve = task.resolve;
+           const origReject = task.reject;
+           
+           task.resolve = (...args) => { res(); origResolve(...args); };
+           task.reject = (...args) => { res(); origReject(...args); };
+           
+           task.start();
+        });
+      }
+    } catch (e) {
+      // handled inside DownloadTask
+    } finally {
+      window._isDownloading = false;
+      window._processDownloadQueue();
     }
-  } catch (e) {
-    // handled inside DownloadTask
-  } finally {
-    window._isDownloading = false;
-    window._processDownloadQueue();
+  };
+
+  if (navigator.locks) {
+    navigator.locks.request('tg-download-active', runDownload);
+  } else {
+    runDownload();
   }
 };
 
@@ -1771,7 +1783,7 @@ window.swStreamDownload = async function(client, Api, msg, fileName, mime, size)
   item.className = "upload-item";
   item.innerHTML = `<div class="upload-item-icon"><i class="${fileIcon(fileTypeFromMime("application/octet-stream", fileName))}"></i></div>
   <div class="upload-item-info">
-    <div class="upload-item-name">${esc(fileName)}</div>
+    <div class="upload-item-name" title="${esc(fileName)}">${esc(fileName)}</div>
     <div class="upload-progress"><div class="upload-progress-bar" style="width:0%"></div></div>
     <div class="upload-status">Queued...</div>
   </div>
@@ -1801,9 +1813,10 @@ async function downloadFile(id, name) {
   
   // 1. Direct-to-Disk Streaming (Desktop Chrome/Edge/Opera)
   if (window.showSaveFilePicker) {
+    let writable;
     try {
       const handle = await window.showSaveFilePicker({ suggestedName: finalName });
-      const writable = await handle.createWritable();
+      writable = await handle.createWritable();
       
       toast(`Downloading "${finalName}"... (Streaming direct to disk)`, "info");
       
@@ -1812,12 +1825,14 @@ async function downloadFile(id, name) {
       
       await window.fastStreamDownload(client, Api, messages[0], writable, finalName);
       
-      await writable.close();
+      // writable.close() is now handled inside DownloadTask on success
       
       toast(`"${finalName}" downloaded successfully`, "success");
       return;
     } catch (e) {
       if (e.name === 'AbortError') return;
+      // Safety net: ensure writable is closed so .crswap is finalized even on error
+      if (writable) { try { await writable.close(); } catch(_) {} }
       console.error("Stream download failed:", e);
       toast("Stream download failed, trying alternative...", "warning");
     }

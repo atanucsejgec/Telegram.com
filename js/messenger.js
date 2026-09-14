@@ -892,20 +892,23 @@ async function performDownloadMedia(client, msg, fileName) {
 
   // 1. Direct-to-Disk Streaming (Desktop Chrome/Edge/Opera)
   if (window.showSaveFilePicker) {
+    let writable;
     try {
       const handle = await window.showSaveFilePicker({ suggestedName: fileName });
-      const writable = await handle.createWritable();
+      writable = await handle.createWritable();
       
       toast(`Downloading "${fileName}"... (Streaming direct to disk)`, "info");
       
       await window.fastStreamDownload(client, window.tgApi, msg, writable, fileName);
       
-      await writable.close();
+      // writable.close() is now handled inside DownloadTask on success
       
       toast(`"${fileName}" downloaded successfully`, "success");
       return;
     } catch (e) {
       if (e.name === 'AbortError') return;
+      // Safety net: ensure writable is closed so .crswap is finalized even on error
+      if (writable) { try { await writable.close(); } catch(_) {} }
       console.error("Stream download failed:", e);
       toast("Stream download failed, trying alternative...", "warning");
     }
